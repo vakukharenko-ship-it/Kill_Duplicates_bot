@@ -2,12 +2,12 @@ import asyncio
 import os
 import re
 import logging
-from aiogram import Bot, Dispatcher, types
+from urllib.parse import urlparse
+from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import aiohttp
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,35 +22,54 @@ dp = Dispatcher()
 PROXY_RAW = os.getenv("PROXY_URL", "")
 
 def parse_proxy(raw):
-    """Разбирает прокси-строку, возвращает (url, auth) или (None, None)."""
+    """
+    Приводит прокси к формату (proxy_url_without_auth, auth_object)
+    Поддерживает:
+      - http://user:pass@host:port
+      - user:pass@host:port
+      - host:port:user:pass
+    """
     if not raw:
         return None, None
     raw = raw.strip()
-    # Если уже http:// или https://
+
+    # Если уже есть протокол
     if raw.startswith(("http://", "https://")):
         parsed = urlparse(raw)
-        # Извлекаем логин/пароль из netloc
         if '@' in parsed.netloc:
             user_pass, host = parsed.netloc.split('@', 1)
-            user, passwd = user_pass.split(':', 1) if ':' in user_pass else (user_pass, '')
-            proxy_url = f"{parsed.scheme}://{host}"
-            auth = aiohttp.BasicAuth(login=user, password=passwd)
-            return proxy_url, auth
+            if ':' in user_pass:
+                user, passwd = user_pass.split(':', 1)
+                proxy_url = f"{parsed.scheme}://{host}"
+                auth = aiohttp.BasicAuth(login=user, password=passwd)
+                return proxy_url, auth
         else:
             return raw, None
-    # Если формат host:port:user:pass
+
+    # user:pass@host:port (без схемы)
+    if '@' in raw and ':' in raw.split('@')[0]:
+        user_pass, host_port = raw.split('@', 1)
+        if ':' in user_pass:
+            user, passwd = user_pass.split(':', 1)
+            proxy_url = f"http://{host_port}"
+            auth = aiohttp.BasicAuth(login=user, password=passwd)
+            return proxy_url, auth
+
+    # host:port:user:pass
     parts = raw.split(":")
     if len(parts) == 4:
         host, port, user, passwd = parts
         proxy_url = f"http://{host}:{port}"
         auth = aiohttp.BasicAuth(login=user, password=passwd)
         return proxy_url, auth
-    # Если не распарсили, пробуем как есть
+
+    # Если ничего не подошло
+    logger.warning(f"Не удалось распарсить прокси: {raw}")
     return raw, None
 
 PROXY_URL, PROXY_AUTH = parse_proxy(PROXY_RAW)
 if PROXY_URL:
-    logger.info(f"Прокси: включён, хост: {PROXY_URL}")
+    logger.info(f"Прокси: включён, URL: {PROXY_URL}")
 else:
     logger.info("Прокси: выключен")
 
@@ -80,20 +99,17 @@ async def fetch_html(sku: str, retries: int = 3):
         for attempt in range(1, retries + 1):
             try:
                 logger.info(f"Попытка {attempt} для SKU {sku}")
-                # Если есть прокси, используем его с авторизацией
                 if PROXY_URL and PROXY_AUTH:
                     async with session.get(url, headers=HEADERS, proxy=PROXY_URL, proxy_auth=PROXY_AUTH, timeout=45) as resp:
                         if resp.status != 200:
                             raise Exception(f"HTTP {resp.status}")
                         return await resp.text()
                 elif PROXY_URL:
-                    # без авторизации
                     async with session.get(url, headers=HEADERS, proxy=PROXY_URL, timeout=45) as resp:
                         if resp.status != 200:
                             raise Exception(f"HTTP {resp.status}")
                         return await resp.text()
                 else:
-                    # без прокси
                     async with session.get(url, headers=HEADERS, timeout=45) as resp:
                         if resp.status != 200:
                             raise Exception(f"HTTP {resp.status}")
@@ -104,7 +120,7 @@ async def fetch_html(sku: str, retries: int = 3):
                     raise
                 await asyncio.sleep(3 ** attempt)
             except Exception as e:
-                logger.error(f"Ошибка: {e}")
+                logger.error(f"Ошибка: {type(e).__name__}: {e}")
                 if attempt == retries:
                     raise
                 await asyncio.sleep(3 ** attempt)
@@ -132,7 +148,6 @@ def parse_html(html: str, sku: str):
                 "price": price_digits,
                 "link": f"https://www.ozon.ru/product/{sku}/"
             })
-    # Убираем дубли
     seen = set()
     unique = []
     for s in sellers:
