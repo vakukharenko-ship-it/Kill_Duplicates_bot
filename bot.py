@@ -343,7 +343,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
+# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ (исправленные) ----------
 def fetch_finance_transactions(date_from, date_to):
     """
     Получает все финансовые транзакции за указанный период.
@@ -419,51 +419,79 @@ def fetch_finance_transactions(date_from, date_to):
 
     write_log(f"💰 Загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
-    
+
 def aggregate_finance_expenses(transactions):
     """
-    Принимает список транзакций, возвращает словарь:
-    { 'operation_type_name': сумма_расхода (положительное число) }
-    только для расходов (amount < 0).
+    Агрегирует расходы из транзакций.
+    Возвращает словарь {категория: сумма} для всех расходов (amount < 0).
+    Учитывает как operation_type_name, так и детали из services.
     """
     expense_by_type = {}
+
     for t in transactions:
         amount = t.get("amount", 0)
         if amount >= 0:
-            continue
-        op_type = t.get("operation_type_name", "Неизвестный тип")
-        expense = abs(amount)
-        expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
+            continue  # только расходы
+
+        # Ищем детализированные услуги в поле services
+        services = t.get("services", [])
+        if services and isinstance(services, list):
+            # Если есть services, суммируем по каждому сервису отдельно
+            # При этом общая сумма операции разбивается на части
+            for service in services:
+                service_name = service.get("name", "Неизвестная услуга")
+                service_amount = service.get("amount", 0)
+                if service_amount < 0:
+                    # Сумма может быть отрицательной (расход) или положительной (доход)
+                    # Мы берём по модулю, т.к. это расход
+                    expense = abs(service_amount)
+                    expense_by_type[service_name] = expense_by_type.get(service_name, 0) + expense
+        else:
+            # Если services нет, используем operation_type_name
+            op_type = t.get("operation_type_name", "Неизвестный тип")
+            expense = abs(amount)
+            expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
+
     return expense_by_type
 
 def format_expense_block(expenses_by_type, title, previous_expenses=None):
     """
-    Формирует строку с расходами по типам.
+    Формирует строку с расходами по категориям.
     Если переданы previous_expenses, показывает изменение в процентах.
     """
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
+
     total = sum(expenses_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
+
+    # Сортировка по убыванию суммы
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
-    for op_type, amount in sorted_items:
-        short_name = op_type
-        if "Комиссия" in op_type:
+
+    for category, amount in sorted_items:
+        # Попробуем сделать короткое имя для читаемости
+        short_name = category
+        # Сокращаем часто встречающиеся названия
+        if "Комиссия" in category:
             short_name = "Комиссия"
-        elif "Логистика" in op_type or "Доставка" in op_type:
+        elif "Логистика" in category or "Доставка" in category:
             short_name = "Логистика"
-        elif "Эквайринг" in op_type:
+        elif "Эквайринг" in category:
             short_name = "Эквайринг"
-        elif "Кросс-докинг" in op_type:
+        elif "Кросс-докинг" in category:
             short_name = "Кросс-докинг"
-        elif "Хранение" in op_type:
+        elif "Хранение" in category:
             short_name = "Хранение"
-        elif "Возврат" in op_type:
+        elif "Возврат" in category:
             short_name = "Возвраты"
+        elif "Обработка" in category:
+            short_name = "Обработка"
         else:
-            short_name = op_type[:30]
+            short_name = category[:40]  # обрезаем длинные названия
+
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
+    # Если есть предыдущий период, показываем динамику
     if previous_expenses is not None:
         prev_total = sum(previous_expenses.values()) if previous_expenses else 0
         if prev_total > 0:
@@ -472,6 +500,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
             lines.append(f"  *Изменение vs предыдущий:* {sign}{delta:.1f}%")
         else:
             lines.append("  *Изменение vs предыдущий:* ∞")
+
     return "\n".join(lines)
 
 # ---------- Остальные вспомогательные функции ----------
@@ -570,7 +599,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # Финансовые расходы
+    # Финансовые расходы (новая агрегация)
     expenses_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
     expenses_yesterday = aggregate_finance_expenses(fetch_finance_transactions(yesterday_str, yesterday_str))
     expenses_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, current_month_end_str))
@@ -720,7 +749,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     parts.append(format_today_block())
     parts.append(format_month_block())
 
-    # Добавляем блоки расходов
+    # Блоки расходов (финансовые) — теперь с детальной разбивкой
     parts.append(format_expense_block(expenses_today, "Расходы сегодня", expenses_yesterday))
     parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц (аналог. период)", expenses_prev_month))
 
@@ -944,7 +973,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – логистика, комиссии, эквайринг и другие.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
@@ -968,7 +997,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – логистика, комиссии, эквайринг и другие.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
@@ -1504,7 +1533,7 @@ def main():
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – логистика, комиссии, эквайринг и другие.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
@@ -1528,7 +1557,7 @@ def main():
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – логистика, комиссии, эквайринг и другие.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
