@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import logging
+from urllib.parse import urlparse
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
@@ -19,14 +20,41 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-PROXY_URL = os.getenv("PROXY_URL", "")
+# Прокси – может быть в формате:
+# http://user:pass@host:port
+# или host:port:user:pass (наш случай)
+PROXY_RAW = os.getenv("PROXY_URL", "")
 
+# Преобразуем прокси в формат http://user:pass@host:port
+def normalize_proxy(raw):
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Если уже начинается с http:// или https://, оставляем как есть
+    if raw.startswith(("http://", "https://")):
+        return raw
+    # Убираем "HTTP://" или "HTTPS://" если есть
+    if raw.upper().startswith("HTTP://"):
+        raw = raw[7:]
+    elif raw.upper().startswith("HTTPS://"):
+        raw = raw[8:]
+    # Пытаемся распарсить host:port:user:pass
+    parts = raw.split(":")
+    if len(parts) == 4:
+        host, port, user, passwd = parts
+        return f"http://{user}:{passwd}@{host}:{port}"
+    # Если не получилось, возвращаем как есть (может, уже правильный)
+    return raw
+
+PROXY_URL = normalize_proxy(PROXY_RAW)
+
+# Клавиатура с кнопкой "Старт"
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🚀 Старт")]],
     resize_keyboard=True
 )
 
-# Заголовки для HTML
+# Заголовки для HTML (максимально браузерные)
 HTML_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -42,23 +70,14 @@ HTML_HEADERS = {
     "Referer": "https://www.ozon.ru/",
 }
 
-API_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Content-Type": "application/json",
-    "Origin": "https://www.ozon.ru",
-    "Referer": "https://www.ozon.ru/",
-}
-
 async def fetch_html(sku: str, retries: int = 3):
+    """GET-запрос к странице товара через прокси."""
     url = f"https://www.ozon.ru/product/{sku}/"
-    proxy = PROXY_URL if PROXY_URL else None
     async with aiohttp.ClientSession() as session:
         for attempt in range(1, retries + 1):
             try:
                 logger.info(f"HTML попытка {attempt} для SKU {sku}")
-                async with session.get(url, headers=HTML_HEADERS, proxy=proxy, timeout=60) as resp:
+                async with session.get(url, headers=HTML_HEADERS, proxy=PROXY_URL, timeout=30) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     return await resp.text()
@@ -74,33 +93,11 @@ async def fetch_html(sku: str, retries: int = 3):
                 await asyncio.sleep(3 ** attempt)
     return None
 
-async def fetch_api(sku: str, retries: int = 3):
-    url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
-    payload = {"productId": sku, "layout": "default", "showAll": False}
-    proxy = PROXY_URL if PROXY_URL else None
-    async with aiohttp.ClientSession() as session:
-        for attempt in range(1, retries + 1):
-            try:
-                logger.info(f"API попытка {attempt} для SKU {sku}")
-                async with session.post(url, json=payload, headers=API_HEADERS, proxy=proxy, timeout=60) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"HTTP {resp.status}")
-                    return await resp.json()
-            except asyncio.TimeoutError:
-                logger.warning(f"API таймаут, попытка {attempt}")
-                if attempt == retries:
-                    raise
-                await asyncio.sleep(3 ** attempt)
-            except Exception as e:
-                logger.error(f"API ошибка: {e}")
-                if attempt == retries:
-                    raise
-                await asyncio.sleep(3 ** attempt)
-    return None
-
 def parse_html(html: str, sku: str):
+    """Парсит HTML-страницу и извлекает продавцов."""
     soup = BeautifulSoup(html, "lxml")
     sellers = []
+    # Пробуем селекторы
     price_blocks = soup.select('[data-widget="webPrice"] [data-qa="price-block"]')
     if not price_blocks:
         price_blocks = soup.select('.c6a0, .c9a0')
@@ -121,7 +118,7 @@ def parse_html(html: str, sku: str):
                 "sku": None,
                 "link": f"https://www.ozon.ru/product/{sku}/"
             })
-    # уникальные по имени
+    # Убираем дубли
     seen = set()
     unique = []
     for s in sellers:
@@ -130,45 +127,15 @@ def parse_html(html: str, sku: str):
             unique.append(s)
     return unique
 
-def parse_api(data: dict, sku: str):
-    sellers = []
-    offers = data.get("offers", []) or data.get("product", {}).get("offers", [])
-    for offer in offers:
-        seller_name = offer.get("sellerName") or offer.get("seller", {}).get("name")
-        price = offer.get("price") or offer.get("priceValue")
-        if seller_name and price:
-            sellers.append({
-                "name": seller_name,
-                "price": str(price),
-                "sku": offer.get("sku") or offer.get("sellerSku"),
-                "link": f"https://www.ozon.ru/product/{sku}/"
-            })
-    return sellers
-
 async def fetch_competitors(sku: str):
-    # Сначала HTML
-    try:
-        html = await fetch_html(sku)
-        if html:
-            sellers = parse_html(html, sku)
-            if sellers:
-                return sellers
-            logger.info(f"HTML не дал продавцов для {sku}")
-    except Exception as e:
-        logger.warning(f"HTML не удался для {sku}: {e}")
-
-    # Потом API
-    try:
-        data = await fetch_api(sku)
-        if data:
-            sellers = parse_api(data, sku)
-            if sellers:
-                return sellers
-            logger.info(f"API не дал продавцов для {sku}")
-    except Exception as e:
-        logger.warning(f"API не удался для {sku}: {e}")
-
-    raise Exception("Не удалось получить данные ни через HTML, ни через API")
+    """Получает данные через HTML."""
+    html = await fetch_html(sku)
+    if not html:
+        raise Exception("Не удалось загрузить страницу")
+    sellers = parse_html(html, sku)
+    if not sellers:
+        logger.info(f"Для SKU {sku} не найдено продавцов")
+    return sellers
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
@@ -176,7 +143,7 @@ async def start_cmd(message: Message):
         "👋 Привет! Я помогу найти конкурентов на Ozon.\n"
         "Отправь мне SKU товара (один или несколько через запятую или пробел), и я найду всех продавцов.\n\n"
         "Пример: 1276394240, 3129449681\n\n"
-        "⚠️ Бот работает через HTTP-прокси.",
+        f"🔧 Прокси: {'включён' if PROXY_URL else 'выключен'}",
         reply_markup=start_keyboard
     )
 
