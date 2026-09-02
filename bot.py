@@ -418,7 +418,6 @@ def fetch_finance_transactions(date_from, date_to):
 
     write_log(f"💰 Загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
-
 def aggregate_finance_expenses(transactions):
     """
     Принимает список транзакций, возвращает словарь:
