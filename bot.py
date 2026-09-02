@@ -424,33 +424,41 @@ def aggregate_finance_expenses(transactions):
     """
     Агрегирует расходы из транзакций.
     Возвращает словарь {категория: сумма} для всех расходов (amount < 0).
-    Учитывает как operation_type_name, так и детали из services.
+    Если есть услуги (services), использует их названия.
+    Иначе использует operation_type_name.
+    Также логирует все найденные уникальные категории.
     """
     expense_by_type = {}
+    unique_types = set()
+    unique_services = set()
 
     for t in transactions:
         amount = t.get("amount", 0)
         if amount >= 0:
-            continue  # только расходы
+            continue
 
-        # Ищем детализированные услуги в поле services
+        op_type = t.get("operation_type_name", "Неизвестный тип")
+        unique_types.add(op_type)
+
         services = t.get("services", [])
         if services and isinstance(services, list):
-            # Если есть services, суммируем по каждому сервису отдельно
-            # При этом общая сумма операции разбивается на части
             for service in services:
                 service_name = service.get("name", "Неизвестная услуга")
                 service_amount = service.get("amount", 0)
                 if service_amount < 0:
-                    # Сумма может быть отрицательной (расход) или положительной (доход)
-                    # Мы берём по модулю, т.к. это расход
+                    unique_services.add(service_name)
                     expense = abs(service_amount)
                     expense_by_type[service_name] = expense_by_type.get(service_name, 0) + expense
         else:
-            # Если services нет, используем operation_type_name
-            op_type = t.get("operation_type_name", "Неизвестный тип")
+            # Нет services, используем operation_type_name
             expense = abs(amount)
             expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
+
+    # Логируем найденные категории (если есть транзакции)
+    if transactions:
+        write_log(f"🔍 Найдены operation_type: {', '.join(unique_types)}")
+        if unique_services:
+            write_log(f"🔍 Найдены услуги (services): {', '.join(unique_services)}")
 
     return expense_by_type
 
@@ -599,7 +607,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # Финансовые расходы (новая агрегация)
+    # Финансовые расходы
     expenses_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
     expenses_yesterday = aggregate_finance_expenses(fetch_finance_transactions(yesterday_str, yesterday_str))
     expenses_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, current_month_end_str))
