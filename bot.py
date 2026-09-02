@@ -22,18 +22,9 @@ dp = Dispatcher()
 PROXY_RAW = os.getenv("PROXY_URL", "")
 
 def parse_proxy(raw):
-    """
-    Приводит прокси к формату (proxy_url_without_auth, auth_object)
-    Поддерживает:
-      - http://user:pass@host:port
-      - user:pass@host:port
-      - host:port:user:pass
-    """
     if not raw:
         return None, None
     raw = raw.strip()
-
-    # Если уже есть протокол
     if raw.startswith(("http://", "https://")):
         parsed = urlparse(raw)
         if '@' in parsed.netloc:
@@ -45,8 +36,6 @@ def parse_proxy(raw):
                 return proxy_url, auth
         else:
             return raw, None
-
-    # user:pass@host:port (без схемы)
     if '@' in raw and ':' in raw.split('@')[0]:
         user_pass, host_port = raw.split('@', 1)
         if ':' in user_pass:
@@ -54,17 +43,12 @@ def parse_proxy(raw):
             proxy_url = f"http://{host_port}"
             auth = aiohttp.BasicAuth(login=user, password=passwd)
             return proxy_url, auth
-
-    # host:port:user:pass
     parts = raw.split(":")
     if len(parts) == 4:
         host, port, user, passwd = parts
         proxy_url = f"http://{host}:{port}"
         auth = aiohttp.BasicAuth(login=user, password=passwd)
         return proxy_url, auth
-
-    # Если ничего не подошло
-    logger.warning(f"Не удалось распарсить прокси: {raw}")
     return raw, None
 
 PROXY_URL, PROXY_AUTH = parse_proxy(PROXY_RAW)
@@ -78,6 +62,7 @@ start_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Максимально приближенные к браузеру заголовки + куки
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -92,6 +77,16 @@ HEADERS = {
     "Cache-Control": "max-age=0",
     "Referer": "https://www.ozon.ru/",
 }
+
+# Добавляем фиктивные куки (можно заменить на реальные из браузера)
+# Если у вас есть авторизованная сессия на Ozon, скопируйте значение cookie из браузера и вставьте ниже
+COOKIE_STRING = os.getenv("OZON_COOKIE", "")
+if COOKIE_STRING:
+    HEADERS["Cookie"] = COOKIE_STRING
+    logger.info("Куки добавлены")
+else:
+    # Даже пустая кука помогает
+    HEADERS["Cookie"] = "ozon_geo=RU;"
 
 async def fetch_html(sku: str, retries: int = 3):
     url = f"https://www.ozon.ru/product/{sku}/"
