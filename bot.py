@@ -7,6 +7,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import aiohttp
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,34 +19,40 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Прокси – может быть в формате:
-# http://user:pass@host:port
-# или host:port:user:pass (наш случай)
 PROXY_RAW = os.getenv("PROXY_URL", "")
 
-# Преобразуем прокси в формат http://user:pass@host:port
-def normalize_proxy(raw):
+def parse_proxy(raw):
+    """Разбирает прокси-строку, возвращает (url, auth) или (None, None)."""
     if not raw:
-        return None
+        return None, None
     raw = raw.strip()
-    # Если уже начинается с http:// или https://, оставляем как есть
+    # Если уже http:// или https://
     if raw.startswith(("http://", "https://")):
-        return raw
-    # Убираем "HTTP://" или "HTTPS://" если есть
-    if raw.upper().startswith("HTTP://"):
-        raw = raw[7:]
-    elif raw.upper().startswith("HTTPS://"):
-        raw = raw[8:]
-    # Пытаемся распарсить host:port:user:pass
+        parsed = urlparse(raw)
+        # Извлекаем логин/пароль из netloc
+        if '@' in parsed.netloc:
+            user_pass, host = parsed.netloc.split('@', 1)
+            user, passwd = user_pass.split(':', 1) if ':' in user_pass else (user_pass, '')
+            proxy_url = f"{parsed.scheme}://{host}"
+            auth = aiohttp.BasicAuth(login=user, password=passwd)
+            return proxy_url, auth
+        else:
+            return raw, None
+    # Если формат host:port:user:pass
     parts = raw.split(":")
     if len(parts) == 4:
         host, port, user, passwd = parts
-        return f"http://{user}:{passwd}@{host}:{port}"
-    # Если не получилось, возвращаем как есть (может, уже правильный)
-    return raw
+        proxy_url = f"http://{host}:{port}"
+        auth = aiohttp.BasicAuth(login=user, password=passwd)
+        return proxy_url, auth
+    # Если не распарсили, пробуем как есть
+    return raw, None
 
-PROXY_URL = normalize_proxy(PROXY_RAW)
-logger.info(f"Прокси: {'включён' if PROXY_URL else 'выключен'}")
+PROXY_URL, PROXY_AUTH = parse_proxy(PROXY_RAW)
+if PROXY_URL:
+    logger.info(f"Прокси: включён, хост: {PROXY_URL}")
+else:
+    logger.info("Прокси: выключен")
 
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🚀 Старт")]],
@@ -73,10 +80,24 @@ async def fetch_html(sku: str, retries: int = 3):
         for attempt in range(1, retries + 1):
             try:
                 logger.info(f"Попытка {attempt} для SKU {sku}")
-                async with session.get(url, headers=HEADERS, proxy=PROXY_URL, timeout=30) as resp:
-                    if resp.status != 200:
-                        raise Exception(f"HTTP {resp.status}")
-                    return await resp.text()
+                # Если есть прокси, используем его с авторизацией
+                if PROXY_URL and PROXY_AUTH:
+                    async with session.get(url, headers=HEADERS, proxy=PROXY_URL, proxy_auth=PROXY_AUTH, timeout=45) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+                        return await resp.text()
+                elif PROXY_URL:
+                    # без авторизации
+                    async with session.get(url, headers=HEADERS, proxy=PROXY_URL, timeout=45) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+                        return await resp.text()
+                else:
+                    # без прокси
+                    async with session.get(url, headers=HEADERS, timeout=45) as resp:
+                        if resp.status != 200:
+                            raise Exception(f"HTTP {resp.status}")
+                        return await resp.text()
             except asyncio.TimeoutError:
                 logger.warning(f"Таймаут, попытка {attempt}")
                 if attempt == retries:
