@@ -29,7 +29,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_CHAT_ID = 6134182006
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
-OZON_FINANCE_URL = "https://api-seller.ozon.ru/v3/finance/transaction/list"   # Добавлено
+OZON_FINANCE_URL = "https://api-seller.ozon.ru/v3/finance/transaction/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
@@ -343,31 +343,28 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- НОВОЕ: Функции для финансовых транзакций (расходы) ----------
+# ---------- ИСПРАВЛЕННАЯ ФУНКЦИЯ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
 def fetch_finance_transactions(date_from, date_to):
     """
     Получает все финансовые транзакции за указанный период.
     date_from, date_to — строки в формате 'YYYY-MM-DD'
     Возвращает список транзакций.
     """
+    # Проверка на будущие даты
+    today_str = get_moscow_today().isoformat()
+    if date_from > today_str:
+        return []
+    if date_to > today_str:
+        date_to = today_str
+
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
-    # Преобразуем даты в ISO с временем (начало и конец дня по МСК)
-    try:
-        from_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
-        to_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
-    except:
-        # если переданы уже полные даты, используем как есть
-        from_dt = datetime.datetime.fromisoformat(date_from)
-        to_dt = datetime.datetime.fromisoformat(date_to)
-
-    from_dt = from_dt.replace(tzinfo=MOSCOW_TZ)
-    to_dt = to_dt.replace(tzinfo=MOSCOW_TZ)
-    from_iso = from_dt.isoformat()
-    to_iso = to_dt.isoformat()
+    # Формируем ISO с временем и часовым поясом +03:00
+    from_iso = date_from + "T00:00:00+03:00"
+    to_iso = date_to + "T23:59:59+03:00"
 
     payload = {
         "filter": {
@@ -409,9 +406,8 @@ def aggregate_finance_expenses(transactions):
     for t in transactions:
         amount = t.get("amount", 0)
         if amount >= 0:
-            continue  # это доход или нулевая операция
+            continue
         op_type = t.get("operation_type_name", "Неизвестный тип")
-        # сумма расхода берём по модулю
         expense = abs(amount)
         expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
     return expense_by_type
@@ -425,10 +421,8 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         return f"🔹 *{title}*\nНет данных о расходах.\n"
     total = sum(expenses_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
-    # Сортировка по убыванию суммы
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
     for op_type, amount in sorted_items:
-        # Сокращаем названия для читаемости
         short_name = op_type
         if "Комиссия" in op_type:
             short_name = "Комиссия"
@@ -443,10 +437,9 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         elif "Возврат" in op_type:
             short_name = "Возвраты"
         else:
-            short_name = op_type[:30]  # обрезаем длинные названия
+            short_name = op_type[:30]
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
-    # Если есть предыдущий период, показываем динамику
     if previous_expenses is not None:
         prev_total = sum(previous_expenses.values()) if previous_expenses else 0
         if prev_total > 0:
@@ -480,11 +473,9 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 
     days_passed = (today_date - current_month_start).days + 1
 
-    # Получаем отгрузки
     postings_current = fetch_postings(current_month_start_str, current_month_end_str)
     postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
-    # Агрегация за вчера (полный день)
     agg_yesterday_full = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -492,7 +483,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     yesterday_full_metrics = agg_yesterday_full.get(yesterday_str, {}) if yesterday_str in agg_yesterday_full else {}
 
-    # Сегодня (с учётом времени)
     agg_today = aggregate_postings(
         postings_current,
         date_from=today_str,
@@ -502,7 +492,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
 
-    # Вчера (с учётом времени, для сравнения)
     agg_yesterday = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -512,7 +501,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
 
-    # Текущий месяц
     agg_current_month = aggregate_postings(
         postings_current,
         date_from=current_month_start_str,
@@ -532,7 +520,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         for key in month_metrics:
             month_metrics[key] += vals.get(key, 0)
 
-    # Предыдущий месяц (аналогичный период)
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_period_end_str = prev_period_end.isoformat()
     agg_prev_month = aggregate_postings(
@@ -554,20 +541,17 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         for key in prev_month_metrics:
             prev_month_metrics[key] += vals.get(key, 0)
 
-    # Рекламные расходы
     ad_today = fetch_advertising_expense(today_str, today_str)
     ad_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # ---------- НОВОЕ: Финансовые расходы ----------
-    # Получаем транзакции за соответствующие периоды
+    # Финансовые расходы
     expenses_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
     expenses_yesterday = aggregate_finance_expenses(fetch_finance_transactions(yesterday_str, yesterday_str))
     expenses_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, current_month_end_str))
     expenses_prev_month = aggregate_finance_expenses(fetch_finance_transactions(previous_month_start_str, previous_month_end_str))
 
-    # Вспомогательные функции для форматирования
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
 
@@ -592,7 +576,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         except:
             return None
 
-    # Динамика для заказов и рекламы
     d_ord_sum = calc_delta(today_metrics.get("ordered_sum", 0), yesterday_metrics.get("ordered_sum", 0))
     d_ord_units = calc_delta(today_metrics.get("ordered_units", 0), yesterday_metrics.get("ordered_units", 0))
     d_del_sum = calc_delta(today_metrics.get("delivered_sum", 0), yesterday_metrics.get("delivered_sum", 0))
@@ -609,7 +592,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
     d_ad_m = calc_delta(ad_month, ad_prev_month)
 
-    # Блок "Вчера" (полный день)
     def format_yesterday_block():
         ordered_sum = fmt_num(yesterday_full_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(yesterday_full_metrics.get("ordered_units", 0))
@@ -634,7 +616,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  📢 Реклама: \n  {ad_expense} ₽\n  ДРР общ: {drr_str}\n  ДРР дост: {eff_drr_str}"
         )
 
-    # Блок "Сегодня"
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
@@ -672,7 +653,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  ДРР дост: {eff_drr_str} | vs Вчера: {delta_ad}"
         )
 
-    # Блок "Текущий месяц"
     def format_month_block():
         ordered_sum = fmt_num(month_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(month_metrics.get("ordered_units", 0))
@@ -710,24 +690,20 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  ДРР дост: {eff_drr_str} | vs предыдущий месяц: {delta_ad_m}"
         )
 
-    # Формируем итоговые части
     parts = []
     if include_yesterday:
         parts.append(format_yesterday_block())
     parts.append(format_today_block())
     parts.append(format_month_block())
 
-    # Добавляем блоки расходов (финансовые)
-    # Сегодня (расходы) с динамикой к вчера
+    # Добавляем блоки расходов
     parts.append(format_expense_block(expenses_today, "Расходы сегодня", expenses_yesterday))
-    # Текущий месяц (расходы) с динамикой к предыдущему месяцу
     parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц (аналог. период)", expenses_prev_month))
 
     return "📊 *Текущие показатели*\n\n\n" + "\n\n".join(parts)
 
 # ---------- Функции для динамики продаж (график) ----------
 def get_monthly_delivered_sum(year):
-    """Возвращает список (12 элементов) сумм доставленных заказов по месяцам для указанного года."""
     start_date = datetime.date(year, 1, 1).isoformat()
     end_date = datetime.date(year, 12, 31).isoformat()
     postings = fetch_postings(start_date, end_date)
@@ -751,9 +727,6 @@ def generate_sales_chart(years_list):
 
     fig, ax = plt.subplots(figsize=(10, 6))
     months = [datetime.date(2000, m, 1) for m in range(1, 13)]
-    month_names = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн",
-                   "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"]
-
     for year, values in data.items():
         ax.plot(months, values, marker='o', label=str(year), linewidth=2)
 
@@ -773,7 +746,7 @@ def generate_sales_chart(years_list):
     plt.close(fig)
     return buf
 
-# ---------- Форматирование одиночных отчётов (без изменений) ----------
+# ---------- Форматирование одиночных отчётов ----------
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -1381,7 +1354,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PERIOD_END
 
-    # ---------- НОВОЕ: Обработка динамики продаж ----------
+    # ---------- Динамика продаж ----------
     if data == "dynamics_current":
         await query.edit_message_text("⏳ Загружаю данные для текущего года...")
         current_year = get_moscow_today().year
