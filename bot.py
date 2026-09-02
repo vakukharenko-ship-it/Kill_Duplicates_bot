@@ -18,46 +18,62 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-PROXY_URL = os.getenv("PROXY_URL", "")          # http://логин:пароль@хост:порт
-OZON_COOKIE = os.getenv("OZON_COOKIE", "")      # строка кук
+# Прокси – может быть в формате:
+# http://user:pass@host:port
+# или host:port:user:pass (наш случай)
+PROXY_RAW = os.getenv("PROXY_URL", "")
+
+# Преобразуем прокси в формат http://user:pass@host:port
+def normalize_proxy(raw):
+    if not raw:
+        return None
+    raw = raw.strip()
+    # Если уже начинается с http:// или https://, оставляем как есть
+    if raw.startswith(("http://", "https://")):
+        return raw
+    # Убираем "HTTP://" или "HTTPS://" если есть
+    if raw.upper().startswith("HTTP://"):
+        raw = raw[7:]
+    elif raw.upper().startswith("HTTPS://"):
+        raw = raw[8:]
+    # Пытаемся распарсить host:port:user:pass
+    parts = raw.split(":")
+    if len(parts) == 4:
+        host, port, user, passwd = parts
+        return f"http://{user}:{passwd}@{host}:{port}"
+    # Если не получилось, возвращаем как есть (может, уже правильный)
+    return raw
+
+PROXY_URL = normalize_proxy(PROXY_RAW)
+logger.info(f"Прокси: {'включён' if PROXY_URL else 'выключен'}")
 
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🚀 Старт")]],
     resize_keyboard=True
 )
 
-# Браузерные заголовки + куки
-def get_headers():
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-        "Referer": "https://www.ozon.ru/",
-    }
-    if OZON_COOKIE:
-        headers["Cookie"] = OZON_COOKIE
-    return headers
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+    "Referer": "https://www.ozon.ru/",
+}
 
 async def fetch_html(sku: str, retries: int = 3):
     url = f"https://www.ozon.ru/product/{sku}/"
     async with aiohttp.ClientSession() as session:
         for attempt in range(1, retries + 1):
             try:
-                logger.info(f"HTML попытка {attempt} для SKU {sku}")
-                async with session.get(
-                    url,
-                    headers=get_headers(),
-                    proxy=PROXY_URL if PROXY_URL else None,
-                    timeout=30
-                ) as resp:
+                logger.info(f"Попытка {attempt} для SKU {sku}")
+                async with session.get(url, headers=HEADERS, proxy=PROXY_URL, timeout=30) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     return await resp.text()
@@ -93,9 +109,9 @@ def parse_html(html: str, sku: str):
             sellers.append({
                 "name": seller_name,
                 "price": price_digits,
-                "sku": None,
                 "link": f"https://www.ozon.ru/product/{sku}/"
             })
+    # Убираем дубли
     seen = set()
     unique = []
     for s in sellers:
@@ -116,9 +132,7 @@ async def start_cmd(message: Message):
     await message.answer(
         "👋 Привет! Я ищу конкурентов на Ozon.\n"
         "Отправь SKU (число) – найду всех продавцов.\n"
-        "Пример: 1276394240, 3129449681\n\n"
-        f"🔧 Прокси: {'включён' if PROXY_URL else 'выключен'}\n"
-        f"🍪 Куки: {'есть' if OZON_COOKIE else 'нет'}",
+        "Пример: 1276394240, 3129449681",
         reply_markup=start_keyboard
     )
 
