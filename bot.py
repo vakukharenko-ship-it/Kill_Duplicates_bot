@@ -369,21 +369,24 @@ def fetch_finance_transactions(date_from, date_to):
     from_iso = date_from + "T00:00:00.000Z"
     to_iso = date_to + "T23:59:59.999Z"
 
-    payload = {
-        "filter": {
-            "date": {
-                "from": from_iso,
-                "to": to_iso
-            }
-        },
-        "limit": 1000,
-        "offset": 0,
-    }
-
     all_transactions = []
+    page = 1
+    page_size = 1000
+
     while True:
+        payload = {
+            "filter": {
+                "date": {
+                    "from": from_iso,
+                    "to": to_iso
+                }
+            },
+            "page": page,
+            "page_size": page_size,
+        }
+
         try:
-            write_log(f"🔍 Запрос finance: {json.dumps(payload)}")
+            write_log(f"🔍 Запрос finance (page={page}): {json.dumps(payload)}")
             response = requests.post(OZON_FINANCE_URL, headers=headers, json=payload, timeout=15)
 
             if response.status_code == 429:
@@ -393,20 +396,18 @@ def fetch_finance_transactions(date_from, date_to):
             response.raise_for_status()
             data = response.json()
 
-            # В ответе данные могут лежать в result.operations или result.items
+            # В ответе данные лежат в result.operations
             items = data.get("result", {}).get("operations", [])
-            if not items:
-                items = data.get("result", {}).get("items", [])
-
             if not items:
                 break
 
             all_transactions.extend(items)
 
-            if len(items) < payload["limit"]:
+            # Если получили меньше, чем запросили, значит это последняя страница
+            if len(items) < page_size:
                 break
 
-            payload["offset"] += payload["limit"]
+            page += 1
 
         except requests.exceptions.HTTPError as e:
             error_text = e.response.text if e.response else str(e)
@@ -418,6 +419,7 @@ def fetch_finance_transactions(date_from, date_to):
 
     write_log(f"💰 Загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
+    
 def aggregate_finance_expenses(transactions):
     """
     Принимает список транзакций, возвращает словарь:
