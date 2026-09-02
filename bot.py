@@ -353,9 +353,11 @@ def fetch_finance_transactions(date_from, date_to):
     # Проверка на будущие даты
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
+        write_log(f"⏭️ Пропуск запроса: date_from ({date_from}) > today ({today_str})")
         return []
     if date_to > today_str:
         date_to = today_str
+        write_log(f"⏭️ Обрезан date_to до {date_to} (сегодня)")
 
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -367,16 +369,15 @@ def fetch_finance_transactions(date_from, date_to):
     to_iso = date_to + "T23:59:59+03:00"
 
     payload = {
-        "filter": {
-            "date_from": from_iso,
-            "date_to": to_iso,
-        },
+        "date_from": from_iso,
+        "date_to": to_iso,
         "limit": 1000,
         "offset": 0,
     }
     all_transactions = []
     while True:
         try:
+            write_log(f"🔍 Запрос finance: {json.dumps(payload)}")
             response = requests.post(OZON_FINANCE_URL, headers=headers, json=payload, timeout=15)
             if response.status_code == 429:
                 time.sleep(10)
@@ -390,6 +391,10 @@ def fetch_finance_transactions(date_from, date_to):
             if len(items) < payload["limit"]:
                 break
             payload["offset"] += payload["limit"]
+        except requests.exceptions.HTTPError as e:
+            error_text = e.response.text if e.response else str(e)
+            write_log(f"❌ Ошибка получения финансовых транзакций: {e}, ответ: {error_text[:500]}")
+            break
         except Exception as e:
             write_log(f"❌ Ошибка получения финансовых транзакций: {e}")
             break
