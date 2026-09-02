@@ -2,13 +2,14 @@ import asyncio
 import os
 import re
 import logging
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import aiohttp
-from bs4 import BeautifulSoup
 from aiohttp_socks import ProxyConnector
+from bs4 import BeautifulSoup
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -19,14 +20,32 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-OZON_COOKIE = os.getenv("OZON_COOKIE", "")
-PROXY_URL = os.getenv("PROXY_URL", None)
+# Прокси из переменной окружения (формат: socks5://логин:пароль@хост:порт)
+PROXY_URL = os.getenv("PROXY_URL", "")
 
+# Клавиатура с кнопкой "Старт"
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🚀 Старт")]],
     resize_keyboard=True
 )
 
+# Базовые заголовки, максимально приближенные к реальному браузеру
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+    "Referer": "https://www.ozon.ru/",
+}
+
+# Заголовки для API (JSON)
 API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -36,16 +55,15 @@ API_HEADERS = {
     "Referer": "https://www.ozon.ru/",
 }
 
-def create_connector():
-    if not PROXY_URL:
-        return None
-    # Определяем тип прокси по схеме
-    if PROXY_URL.startswith("socks5://"):
-        return ProxyConnector.from_url(PROXY_URL)
-    # Для HTTP/HTTPS используем стандартный aiohttp ProxyConnector
-    # Но aiohttp напрямую не поддерживает авторизацию в HTTP прокси, поэтому лучше использовать aiohttp_socks для всех типов
-    # Однако для HTTP прокси можно использовать aiohttp.ClientSession с proxy параметром, но с авторизацией лучше через aiohttp_socks тоже
-    return ProxyConnector.from_url(PROXY_URL)
+def get_connector():
+    """Создаёт прокси-коннектор, если задан PROXY_URL."""
+    if PROXY_URL:
+        try:
+            return ProxyConnector.from_url(PROXY_URL)
+        except Exception as e:
+            logger.error(f"Ошибка парсинга прокси: {e}")
+            return None
+    return None
 
 async def fetch_competitors_api(sku: str, retries: int = 2):
     url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
@@ -55,19 +73,18 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
         "showAll": False
     }
     headers = API_HEADERS.copy()
-    if OZON_COOKIE:
-        headers["Cookie"] = OZON_COOKIE
 
-    connector = create_connector()
+    connector = get_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
         for attempt in range(1, retries + 1):
             try:
-                logger.info(f"API попытка {attempt} для SKU {sku}")
-                async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
+                logger.info(f"API попытка {attempt} для SKU {sku} через прокси")
+                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     data = await resp.json()
                     sellers = []
+                    # Парсим продавцов
                     offers = data.get("offers", []) or data.get("product", {}).get("offers", [])
                     for offer in offers:
                         seller_name = offer.get("sellerName") or offer.get("seller", {}).get("name")
@@ -79,7 +96,24 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
                                 "sku": offer.get("sku") or offer.get("sellerSku"),
                                 "link": f"https://www.ozon.ru/product/{sku}/"
                             })
-                    return sellers
+                    if not sellers:
+                        # Альтернативный путь
+                        product = data.get("product", {})
+                        for offer in product.get("offers", []):
+                            seller_name = offer.get("sellerName")
+                            price = offer.get("price")
+                            if seller_name and price:
+                                sellers.append({
+                                    "name": seller_name,
+                                    "price": str(price),
+                                    "sku": offer.get("sku"),
+                                    "link": f"https://www.ozon.ru/product/{sku}/"
+                                })
+                    if sellers:
+                        return sellers
+                    else:
+                        # Если продавцов нет, возможно, товар не найден
+                        return []
             except asyncio.TimeoutError:
                 logger.warning(f"API таймаут для SKU {sku}, попытка {attempt}")
                 if attempt == retries:
@@ -92,24 +126,21 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
                 await asyncio.sleep(2 ** attempt)
     return []
 
-async def fetch_competitors_fallback(sku: str):
+async def fetch_competitors_html(sku: str):
     url = f"https://www.ozon.ru/product/{sku}/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-    if OZON_COOKIE:
-        headers["Cookie"] = OZON_COOKIE
+    headers = BASE_HEADERS.copy()
 
-    connector = create_connector()
+    connector = get_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
-        async with session.get(url, headers=headers, timeout=20) as resp:
+        async with session.get(url, headers=headers, timeout=30) as resp:
             if resp.status != 200:
                 raise Exception(f"HTML HTTP {resp.status}")
             html = await resp.text()
 
     soup = BeautifulSoup(html, "lxml")
     sellers = []
+
+    # Пробуем разные селекторы
     price_blocks = soup.select('[data-widget="webPrice"] [data-qa="price-block"]')
     if not price_blocks:
         price_blocks = soup.select('.c6a0, .c9a0')
@@ -132,6 +163,7 @@ async def fetch_competitors_fallback(sku: str):
                 "link": url
             })
 
+    # Убираем дубли
     seen = set()
     unique = []
     for s in sellers:
@@ -141,16 +173,17 @@ async def fetch_competitors_fallback(sku: str):
     return unique
 
 async def fetch_competitors(sku: str):
+    """Сначала API, если пусто – HTML."""
     try:
         sellers = await fetch_competitors_api(sku)
         if sellers:
             return sellers
         logger.info(f"API вернул пусто для {sku}, пробуем HTML")
-        return await fetch_competitors_fallback(sku)
+        return await fetch_competitors_html(sku)
     except Exception as e:
         logger.warning(f"API не удался для {sku}: {e}, пробуем HTML")
         try:
-            return await fetch_competitors_fallback(sku)
+            return await fetch_competitors_html(sku)
         except Exception as e2:
             raise Exception(f"Не удалось получить данные ни через API, ни через HTML: {e2}")
 
@@ -160,7 +193,7 @@ async def start_cmd(message: Message):
         "👋 Привет! Я помогу найти конкурентов на Ozon.\n"
         "Отправь мне SKU товара (один или несколько через запятую или пробел), и я найду всех продавцов.\n\n"
         "Пример: 1276394240, 3129449681\n\n"
-        "⚠️ Если бот выдаёт ошибку 403 – нужно добавить куки сессии Ozon.",
+        "⚠️ Бот работает через прокси, поэтому не требует кук.",
         reply_markup=start_keyboard
     )
 
