@@ -5,7 +5,7 @@ import json
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import aiohttp
 from bs4 import BeautifulSoup
 
@@ -21,9 +21,13 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 OZON_COOKIE = os.getenv("OZON_COOKIE", "")
-
-# Прокси (если нужно) – можно задать через переменную PROXY_URL
 PROXY_URL = os.getenv("PROXY_URL", None)
+
+# Клавиатура с кнопкой "Старт"
+start_keyboard = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="🚀 Старт")]],
+    resize_keyboard=True
+)
 
 # Заголовки для API
 API_HEADERS = {
@@ -36,9 +40,6 @@ API_HEADERS = {
 }
 
 async def fetch_competitors_api(sku: str, retries: int = 2):
-    """
-    Пытаемся получить данные через API Ozon (JSON).
-    """
     url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
     payload = {
         "productId": sku,
@@ -57,9 +58,7 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     data = await resp.json()
-                    # Парсим продавцов из JSON
                     sellers = []
-                    # Структура может меняться, ищем блок offers
                     offers = data.get("offers", []) or data.get("product", {}).get("offers", [])
                     for offer in offers:
                         seller_name = offer.get("sellerName") or offer.get("seller", {}).get("name")
@@ -72,7 +71,6 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
                                 "link": f"https://www.ozon.ru/product/{sku}/"
                             })
                     if not sellers:
-                        # Попробуем найти в другом месте
                         product = data.get("product", {})
                         for offer in product.get("offers", []):
                             seller_name = offer.get("sellerName")
@@ -98,9 +96,6 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
     return []
 
 async def fetch_competitors_fallback(sku: str):
-    """
-    Запасной вариант – парсинг HTML (если API не сработал).
-    """
     url = f"https://www.ozon.ru/product/{sku}/"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -139,7 +134,6 @@ async def fetch_competitors_fallback(sku: str):
                 "link": url
             })
 
-    # Убираем дубли
     seen = set()
     unique = []
     for s in sellers:
@@ -149,14 +143,10 @@ async def fetch_competitors_fallback(sku: str):
     return unique
 
 async def fetch_competitors(sku: str):
-    """
-    Основная функция: сначала API, если ошибка – fallback HTML.
-    """
     try:
         sellers = await fetch_competitors_api(sku)
         if sellers:
             return sellers
-        # Если API вернул пустой список, пробуем HTML
         logger.info(f"API вернул пусто для {sku}, пробуем HTML")
         return await fetch_competitors_fallback(sku)
     except Exception as e:
@@ -172,14 +162,19 @@ async def start_cmd(message: Message):
         "👋 Привет! Я помогу найти конкурентов на Ozon.\n"
         "Отправь мне SKU товара (один или несколько через запятую или пробел), и я найду всех продавцов.\n\n"
         "Пример: 1276394240, 3129449681\n\n"
-        "⚠️ Если бот выдаёт ошибку 403 – нужно добавить куки сессии Ozon.\n"
-        "Инструкция: https://telegra.ph/Kak-poluchit-kuki-Ozon-03-04 (или я пришлю позже)."
+        "⚠️ Если бот выдаёт ошибку 403 – нужно добавить куки сессии Ozon.",
+        reply_markup=start_keyboard
     )
 
 @dp.message()
 async def handle_text(message: Message):
     text = message.text.strip()
     if not text:
+        return
+
+    # Если нажата кнопка "Старт" – эмулируем команду /start
+    if text == "🚀 Старт":
+        await start_cmd(message)
         return
 
     skus = re.findall(r"\b\d{7,12}\b", text)
@@ -197,27 +192,36 @@ async def handle_text(message: Message):
         except Exception as e:
             results.append({"sku": sku, "competitors": [], "error": str(e)})
 
+    # Формируем ответ в HTML-формате (безопаснее для ссылок)
     answer_lines = []
     for item in results:
         if item["error"]:
             answer_lines.append(f"❌ SKU {item['sku']}: ошибка — {item['error']}")
         else:
             count = len(item["competitors"])
-            answer_lines.append(f"🛒 SKU {item['sku']}: *{count}* конкурентов")
+            answer_lines.append(f"🛒 SKU {item['sku']}: <b>{count}</b> конкурентов")
             if count:
                 for i, comp in enumerate(item["competitors"], 1):
-                    answer_lines.append(f"   {i}. [{comp['name']}]({comp['link']}) — {comp['price']} ₽, SKU: {comp['sku'] or 'нет'}")
+                    # Экранируем имя продавца (может содержать спецсимволы)
+                    name_safe = comp['name'].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    answer_lines.append(
+                        f"   {i}. <a href='{comp['link']}'>{name_safe}</a> — {comp['price']} ₽, SKU: {comp['sku'] or 'нет'}"
+                    )
             else:
                 answer_lines.append("   ➖ Конкурентов не найдено.")
         answer_lines.append("")
 
     full_answer = "\n".join(answer_lines)
+    if not full_answer.strip():
+        full_answer = "⚠️ Не удалось найти информацию."
+
+    # Отправляем с HTML-парсингом
     if len(full_answer) > 4000:
         chunks = [full_answer[i:i+4000] for i in range(0, len(full_answer), 4000)]
         for chunk in chunks:
-            await message.answer(chunk, parse_mode="Markdown")
+            await message.answer(chunk, parse_mode="HTML", reply_markup=start_keyboard)
     else:
-        await message.answer(full_answer, parse_mode="Markdown")
+        await message.answer(full_answer, parse_mode="HTML", reply_markup=start_keyboard)
 
 async def main():
     await dp.start_polling(bot)
