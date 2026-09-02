@@ -6,7 +6,6 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import aiohttp
-from aiohttp_socks import ProxyConnector, ProxyConnectionError
 from bs4 import BeautifulSoup
 
 # Настройка логирования
@@ -20,16 +19,14 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Прокси (формат: socks5://логин:пароль@хост:порт)
 PROXY_URL = os.getenv("PROXY_URL", "")
 
-# Клавиатура с кнопкой "Старт"
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🚀 Старт")]],
     resize_keyboard=True
 )
 
-# Заголовки для HTML (максимально браузерные)
+# Заголовки для HTML
 HTML_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -45,7 +42,6 @@ HTML_HEADERS = {
     "Referer": "https://www.ozon.ru/",
 }
 
-# Заголовки для API
 API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -55,38 +51,14 @@ API_HEADERS = {
     "Referer": "https://www.ozon.ru/",
 }
 
-def create_connector():
-    """Создаёт SOCKS5 коннектор с логированием."""
-    if not PROXY_URL:
-        return None
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(PROXY_URL)
-        if parsed.scheme != 'socks5':
-            logger.warning(f"Неизвестная схема: {parsed.scheme}, пробуем как socks5")
-        connector = ProxyConnector(
-            proxy_type='socks5',
-            host=parsed.hostname,
-            port=parsed.port,
-            username=parsed.username,
-            password=parsed.password,
-            rdns=True
-        )
-        logger.info(f"Прокси настроен: {parsed.hostname}:{parsed.port}")
-        return connector
-    except Exception as e:
-        logger.error(f"Ошибка создания прокси-коннектора: {e}")
-        return None
-
 async def fetch_html(sku: str, retries: int = 3):
-    """GET-запрос к странице товара через прокси."""
     url = f"https://www.ozon.ru/product/{sku}/"
-    connector = create_connector()
-    async with aiohttp.ClientSession(connector=connector) as session:
+    proxy = PROXY_URL if PROXY_URL else None
+    async with aiohttp.ClientSession() as session:
         for attempt in range(1, retries + 1):
             try:
                 logger.info(f"HTML попытка {attempt} для SKU {sku}")
-                async with session.get(url, headers=HTML_HEADERS, timeout=60) as resp:
+                async with session.get(url, headers=HTML_HEADERS, proxy=proxy, timeout=60) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     return await resp.text()
@@ -103,15 +75,14 @@ async def fetch_html(sku: str, retries: int = 3):
     return None
 
 async def fetch_api(sku: str, retries: int = 3):
-    """POST-запрос к API через прокси."""
     url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
     payload = {"productId": sku, "layout": "default", "showAll": False}
-    connector = create_connector()
-    async with aiohttp.ClientSession(connector=connector) as session:
+    proxy = PROXY_URL if PROXY_URL else None
+    async with aiohttp.ClientSession() as session:
         for attempt in range(1, retries + 1):
             try:
                 logger.info(f"API попытка {attempt} для SKU {sku}")
-                async with session.post(url, json=payload, headers=API_HEADERS, timeout=60) as resp:
+                async with session.post(url, json=payload, headers=API_HEADERS, proxy=proxy, timeout=60) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     return await resp.json()
@@ -128,10 +99,8 @@ async def fetch_api(sku: str, retries: int = 3):
     return None
 
 def parse_html(html: str, sku: str):
-    """Парсит HTML-страницу и извлекает продавцов."""
     soup = BeautifulSoup(html, "lxml")
     sellers = []
-    # Пробуем селекторы
     price_blocks = soup.select('[data-widget="webPrice"] [data-qa="price-block"]')
     if not price_blocks:
         price_blocks = soup.select('.c6a0, .c9a0')
@@ -152,7 +121,7 @@ def parse_html(html: str, sku: str):
                 "sku": None,
                 "link": f"https://www.ozon.ru/product/{sku}/"
             })
-    # Убираем дубли
+    # уникальные по имени
     seen = set()
     unique = []
     for s in sellers:
@@ -162,7 +131,6 @@ def parse_html(html: str, sku: str):
     return unique
 
 def parse_api(data: dict, sku: str):
-    """Парсит JSON-ответ API."""
     sellers = []
     offers = data.get("offers", []) or data.get("product", {}).get("offers", [])
     for offer in offers:
@@ -178,8 +146,7 @@ def parse_api(data: dict, sku: str):
     return sellers
 
 async def fetch_competitors(sku: str):
-    """Сначала пробуем HTML (GET), если нет – API (POST)."""
-    # Попытка HTML
+    # Сначала HTML
     try:
         html = await fetch_html(sku)
         if html:
@@ -190,7 +157,7 @@ async def fetch_competitors(sku: str):
     except Exception as e:
         logger.warning(f"HTML не удался для {sku}: {e}")
 
-    # Если HTML не помог, пробуем API
+    # Потом API
     try:
         data = await fetch_api(sku)
         if data:
@@ -201,7 +168,6 @@ async def fetch_competitors(sku: str):
     except Exception as e:
         logger.warning(f"API не удался для {sku}: {e}")
 
-    # Если ничего не помогло
     raise Exception("Не удалось получить данные ни через HTML, ни через API")
 
 @dp.message(CommandStart())
@@ -210,7 +176,7 @@ async def start_cmd(message: Message):
         "👋 Привет! Я помогу найти конкурентов на Ozon.\n"
         "Отправь мне SKU товара (один или несколько через запятую или пробел), и я найду всех продавцов.\n\n"
         "Пример: 1276394240, 3129449681\n\n"
-        "⚠️ Бот работает через прокси, поэтому не требует кук.",
+        "⚠️ Бот работает через HTTP-прокси.",
         reply_markup=start_keyboard
     )
 
