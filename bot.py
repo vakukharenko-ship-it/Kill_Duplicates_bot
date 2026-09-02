@@ -1,11 +1,17 @@
 import asyncio
 import os
 import re
+import random
+import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 import aiohttp
 from bs4 import BeautifulSoup
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
@@ -16,25 +22,62 @@ dp = Dispatcher()
 
 OZON_COOKIE = os.getenv("OZON_COOKIE", "")
 
-async def fetch_competitors(sku: str):
+# Базовые заголовки, максимально приближенные к реальному браузеру
+BASE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+    "Referer": "https://www.ozon.ru/",
+}
+
+async def fetch_competitors(sku: str, retries: int = 3):
     url = f"https://www.ozon.ru/product/{sku}/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
+    headers = BASE_HEADERS.copy()
     if OZON_COOKIE:
         headers["Cookie"] = OZON_COOKIE
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                raise Exception(f"HTTP {response.status}")
-            html = await response.text()
+        for attempt in range(1, retries + 1):
+            try:
+                logger.info(f"Попытка {attempt} для SKU {sku}")
+                async with session.get(url, headers=headers, timeout=30) as response:
+                    if response.status == 403:
+                        # Пробуем с другим User-Agent (мобильный)
+                        if attempt == 2:
+                            headers["User-Agent"] = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+                            logger.info("Переключился на мобильный User-Agent")
+                        if attempt == 3:
+                            # Пробуем без сжатия
+                            headers.pop("Accept-Encoding", None)
+                            logger.info("Убрал Accept-Encoding")
+                        raise Exception(f"HTTP {response.status}")
+                    if response.status != 200:
+                        raise Exception(f"HTTP {response.status}")
+                    html = await response.text()
+                    break
+            except asyncio.TimeoutError:
+                logger.warning(f"Таймаут для SKU {sku}, попытка {attempt}")
+                if attempt == retries:
+                    raise Exception("Таймаут при загрузке страницы")
+                await asyncio.sleep(2 ** attempt)  # экспоненциальная задержка
+            except Exception as e:
+                logger.error(f"Ошибка для SKU {sku}: {e}")
+                if attempt == retries:
+                    raise
+                await asyncio.sleep(2 ** attempt)
 
     soup = BeautifulSoup(html, "lxml")
     sellers = []
 
-    # Пробуем разные селекторы (может меняться со временем)
+    # Пробуем разные селекторы
     price_blocks = soup.select('[data-widget="webPrice"] [data-qa="price-block"]')
     if not price_blocks:
         price_blocks = soup.select('.c6a0, .c9a0')
@@ -71,7 +114,8 @@ async def start_cmd(message: Message):
     await message.answer(
         "👋 Привет! Я помогу найти конкурентов на Ozon.\n"
         "Отправь мне SKU товара (один или несколько через запятую или пробел), и я найду всех продавцов.\n\n"
-        "Пример: 1276394240, 3129449681"
+        "Пример: 1276394240, 3129449681\n\n"
+        "⚠️ Если не находит конкурентов – возможно, нужно добавить куки сессии Ozon. Инструкция в ближайшее время."
     )
 
 @dp.message()
