@@ -6,7 +6,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import aiohttp
-from aiohttp_socks import ProxyConnector
+from aiohttp_socks import ProxyConnector, ProxyConnectionError
 from bs4 import BeautifulSoup
 
 # Настройка логирования
@@ -20,7 +20,7 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Прокси из переменной окружения (формат: socks5://логин:пароль@хост:порт)
+# Прокси (формат: socks5://логин:пароль@хост:порт)
 PROXY_URL = os.getenv("PROXY_URL", "")
 
 # Клавиатура с кнопкой "Старт"
@@ -29,7 +29,7 @@ start_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Базовые заголовки, максимально приближенные к реальному браузеру
+# Базовые заголовки (максимально браузерные)
 BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -45,7 +45,6 @@ BASE_HEADERS = {
     "Referer": "https://www.ozon.ru/",
 }
 
-# Заголовки для API (JSON)
 API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -55,15 +54,30 @@ API_HEADERS = {
     "Referer": "https://www.ozon.ru/",
 }
 
-def get_connector():
-    """Создаёт прокси-коннектор, если задан PROXY_URL."""
-    if PROXY_URL:
-        try:
-            return ProxyConnector.from_url(PROXY_URL)
-        except Exception as e:
-            logger.error(f"Ошибка парсинга прокси: {e}")
+def create_connector():
+    """Создаёт SOCKS5 коннектор из переменной PROXY_URL."""
+    if not PROXY_URL:
+        return None
+    try:
+        # Ручной разбор URL для надёжности
+        from urllib.parse import urlparse
+        parsed = urlparse(PROXY_URL)
+        if parsed.scheme != 'socks5':
+            logger.warning(f"Неизвестная схема прокси: {parsed.scheme}, ожидается socks5")
             return None
-    return None
+        connector = ProxyConnector(
+            proxy_type='socks5',
+            host=parsed.hostname,
+            port=parsed.port,
+            username=parsed.username,
+            password=parsed.password,
+            rdns=True  # Разрешать DNS через прокси
+        )
+        logger.info(f"Прокси настроен: {parsed.hostname}:{parsed.port}")
+        return connector
+    except Exception as e:
+        logger.error(f"Ошибка создания прокси-коннектора: {e}")
+        return None
 
 async def fetch_competitors_api(sku: str, retries: int = 2):
     url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
@@ -72,19 +86,16 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
         "layout": "default",
         "showAll": False
     }
-    headers = API_HEADERS.copy()
-
-    connector = get_connector()
+    connector = create_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
         for attempt in range(1, retries + 1):
             try:
                 logger.info(f"API попытка {attempt} для SKU {sku} через прокси")
-                async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                async with session.post(url, json=payload, headers=API_HEADERS, timeout=30) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     data = await resp.json()
                     sellers = []
-                    # Парсим продавцов
                     offers = data.get("offers", []) or data.get("product", {}).get("offers", [])
                     for offer in offers:
                         seller_name = offer.get("sellerName") or offer.get("seller", {}).get("name")
@@ -96,23 +107,10 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
                                 "sku": offer.get("sku") or offer.get("sellerSku"),
                                 "link": f"https://www.ozon.ru/product/{sku}/"
                             })
-                    if not sellers:
-                        # Альтернативный путь
-                        product = data.get("product", {})
-                        for offer in product.get("offers", []):
-                            seller_name = offer.get("sellerName")
-                            price = offer.get("price")
-                            if seller_name and price:
-                                sellers.append({
-                                    "name": seller_name,
-                                    "price": str(price),
-                                    "sku": offer.get("sku"),
-                                    "link": f"https://www.ozon.ru/product/{sku}/"
-                                })
                     if sellers:
                         return sellers
                     else:
-                        # Если продавцов нет, возможно, товар не найден
+                        # Возможно, у товара нет конкурентов
                         return []
             except asyncio.TimeoutError:
                 logger.warning(f"API таймаут для SKU {sku}, попытка {attempt}")
@@ -128,19 +126,15 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
 
 async def fetch_competitors_html(sku: str):
     url = f"https://www.ozon.ru/product/{sku}/"
-    headers = BASE_HEADERS.copy()
-
-    connector = get_connector()
+    connector = create_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
-        async with session.get(url, headers=headers, timeout=30) as resp:
+        async with session.get(url, headers=BASE_HEADERS, timeout=30) as resp:
             if resp.status != 200:
                 raise Exception(f"HTML HTTP {resp.status}")
             html = await resp.text()
 
     soup = BeautifulSoup(html, "lxml")
     sellers = []
-
-    # Пробуем разные селекторы
     price_blocks = soup.select('[data-widget="webPrice"] [data-qa="price-block"]')
     if not price_blocks:
         price_blocks = soup.select('.c6a0, .c9a0')
@@ -173,7 +167,7 @@ async def fetch_competitors_html(sku: str):
     return unique
 
 async def fetch_competitors(sku: str):
-    """Сначала API, если пусто – HTML."""
+    """Сначала API, если пусто или ошибка – HTML."""
     try:
         sellers = await fetch_competitors_api(sku)
         if sellers:
