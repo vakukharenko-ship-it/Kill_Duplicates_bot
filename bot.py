@@ -364,33 +364,50 @@ def fetch_finance_transactions(date_from, date_to):
         "Api-Key": OZON_API_KEY,
         "Content-Type": "application/json",
     }
-    # Формируем ISO с временем и часовым поясом +03:00
-    from_iso = date_from + "T00:00:00+03:00"
-    to_iso = date_to + "T23:59:59+03:00"
+
+    # Формат даты: ISO с миллисекундами и часовым поясом UTC (Z)
+    from_iso = date_from + "T00:00:00.000Z"
+    to_iso = date_to + "T23:59:59.999Z"
 
     payload = {
-        "date_from": from_iso,
-        "date_to": to_iso,
+        "filter": {
+            "date": {
+                "from": from_iso,
+                "to": to_iso
+            }
+        },
         "limit": 1000,
         "offset": 0,
     }
+
     all_transactions = []
     while True:
         try:
             write_log(f"🔍 Запрос finance: {json.dumps(payload)}")
             response = requests.post(OZON_FINANCE_URL, headers=headers, json=payload, timeout=15)
+
             if response.status_code == 429:
                 time.sleep(10)
                 continue
+
             response.raise_for_status()
             data = response.json()
-            items = data.get("result", {}).get("items", [])
+
+            # В ответе данные могут лежать в result.operations или result.items
+            items = data.get("result", {}).get("operations", [])
+            if not items:
+                items = data.get("result", {}).get("items", [])
+
             if not items:
                 break
+
             all_transactions.extend(items)
+
             if len(items) < payload["limit"]:
                 break
+
             payload["offset"] += payload["limit"]
+
         except requests.exceptions.HTTPError as e:
             error_text = e.response.text if e.response else str(e)
             write_log(f"❌ Ошибка получения финансовых транзакций: {e}, ответ: {error_text[:500]}")
@@ -398,6 +415,7 @@ def fetch_finance_transactions(date_from, date_to):
         except Exception as e:
             write_log(f"❌ Ошибка получения финансовых транзакций: {e}")
             break
+
     write_log(f"💰 Загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
 
