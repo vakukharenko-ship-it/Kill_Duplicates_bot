@@ -1,15 +1,14 @@
 import asyncio
 import os
 import re
-import json
 import logging
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 import aiohttp
 from bs4 import BeautifulSoup
+from aiohttp_socks import ProxyConnector
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -23,13 +22,11 @@ dp = Dispatcher()
 OZON_COOKIE = os.getenv("OZON_COOKIE", "")
 PROXY_URL = os.getenv("PROXY_URL", None)
 
-# Клавиатура с кнопкой "Старт"
 start_keyboard = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="🚀 Старт")]],
     resize_keyboard=True
 )
 
-# Заголовки для API
 API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -38,6 +35,17 @@ API_HEADERS = {
     "Origin": "https://www.ozon.ru",
     "Referer": "https://www.ozon.ru/",
 }
+
+def create_connector():
+    if not PROXY_URL:
+        return None
+    # Определяем тип прокси по схеме
+    if PROXY_URL.startswith("socks5://"):
+        return ProxyConnector.from_url(PROXY_URL)
+    # Для HTTP/HTTPS используем стандартный aiohttp ProxyConnector
+    # Но aiohttp напрямую не поддерживает авторизацию в HTTP прокси, поэтому лучше использовать aiohttp_socks для всех типов
+    # Однако для HTTP прокси можно использовать aiohttp.ClientSession с proxy параметром, но с авторизацией лучше через aiohttp_socks тоже
+    return ProxyConnector.from_url(PROXY_URL)
 
 async def fetch_competitors_api(sku: str, retries: int = 2):
     url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
@@ -50,11 +58,12 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
     if OZON_COOKIE:
         headers["Cookie"] = OZON_COOKIE
 
-    async with aiohttp.ClientSession() as session:
+    connector = create_connector()
+    async with aiohttp.ClientSession(connector=connector) as session:
         for attempt in range(1, retries + 1):
             try:
                 logger.info(f"API попытка {attempt} для SKU {sku}")
-                async with session.post(url, json=payload, headers=headers, proxy=PROXY_URL, timeout=20) as resp:
+                async with session.post(url, json=payload, headers=headers, timeout=20) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
                     data = await resp.json()
@@ -70,18 +79,6 @@ async def fetch_competitors_api(sku: str, retries: int = 2):
                                 "sku": offer.get("sku") or offer.get("sellerSku"),
                                 "link": f"https://www.ozon.ru/product/{sku}/"
                             })
-                    if not sellers:
-                        product = data.get("product", {})
-                        for offer in product.get("offers", []):
-                            seller_name = offer.get("sellerName")
-                            price = offer.get("price")
-                            if seller_name and price:
-                                sellers.append({
-                                    "name": seller_name,
-                                    "price": str(price),
-                                    "sku": offer.get("sku"),
-                                    "link": f"https://www.ozon.ru/product/{sku}/"
-                                })
                     return sellers
             except asyncio.TimeoutError:
                 logger.warning(f"API таймаут для SKU {sku}, попытка {attempt}")
@@ -104,8 +101,9 @@ async def fetch_competitors_fallback(sku: str):
     if OZON_COOKIE:
         headers["Cookie"] = OZON_COOKIE
 
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers, proxy=PROXY_URL, timeout=20) as resp:
+    connector = create_connector()
+    async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.get(url, headers=headers, timeout=20) as resp:
             if resp.status != 200:
                 raise Exception(f"HTML HTTP {resp.status}")
             html = await resp.text()
@@ -172,7 +170,6 @@ async def handle_text(message: Message):
     if not text:
         return
 
-    # Если нажата кнопка "Старт" – эмулируем команду /start
     if text == "🚀 Старт":
         await start_cmd(message)
         return
@@ -192,7 +189,6 @@ async def handle_text(message: Message):
         except Exception as e:
             results.append({"sku": sku, "competitors": [], "error": str(e)})
 
-    # Формируем ответ в HTML-формате (безопаснее для ссылок)
     answer_lines = []
     for item in results:
         if item["error"]:
@@ -202,7 +198,6 @@ async def handle_text(message: Message):
             answer_lines.append(f"🛒 SKU {item['sku']}: <b>{count}</b> конкурентов")
             if count:
                 for i, comp in enumerate(item["competitors"], 1):
-                    # Экранируем имя продавца (может содержать спецсимволы)
                     name_safe = comp['name'].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                     answer_lines.append(
                         f"   {i}. <a href='{comp['link']}'>{name_safe}</a> — {comp['price']} ₽, SKU: {comp['sku'] or 'нет'}"
@@ -215,7 +210,6 @@ async def handle_text(message: Message):
     if not full_answer.strip():
         full_answer = "⚠️ Не удалось найти информацию."
 
-    # Отправляем с HTML-парсингом
     if len(full_answer) > 4000:
         chunks = [full_answer[i:i+4000] for i in range(0, len(full_answer), 4000)]
         for chunk in chunks:
