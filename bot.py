@@ -29,8 +29,8 @@ start_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-# Базовые заголовки (максимально браузерные)
-BASE_HEADERS = {
+# Заголовки для HTML (максимально браузерные)
+HTML_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -45,6 +45,7 @@ BASE_HEADERS = {
     "Referer": "https://www.ozon.ru/",
 }
 
+# Заголовки для API
 API_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -55,23 +56,21 @@ API_HEADERS = {
 }
 
 def create_connector():
-    """Создаёт SOCKS5 коннектор из переменной PROXY_URL."""
+    """Создаёт SOCKS5 коннектор с логированием."""
     if not PROXY_URL:
         return None
     try:
-        # Ручной разбор URL для надёжности
         from urllib.parse import urlparse
         parsed = urlparse(PROXY_URL)
         if parsed.scheme != 'socks5':
-            logger.warning(f"Неизвестная схема прокси: {parsed.scheme}, ожидается socks5")
-            return None
+            logger.warning(f"Неизвестная схема: {parsed.scheme}, пробуем как socks5")
         connector = ProxyConnector(
             proxy_type='socks5',
             host=parsed.hostname,
             port=parsed.port,
             username=parsed.username,
             password=parsed.password,
-            rdns=True  # Разрешать DNS через прокси
+            rdns=True
         )
         logger.info(f"Прокси настроен: {parsed.hostname}:{parsed.port}")
         return connector
@@ -79,66 +78,63 @@ def create_connector():
         logger.error(f"Ошибка создания прокси-коннектора: {e}")
         return None
 
-async def fetch_competitors_api(sku: str, retries: int = 2):
-    url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
-    payload = {
-        "productId": sku,
-        "layout": "default",
-        "showAll": False
-    }
+async def fetch_html(sku: str, retries: int = 3):
+    """GET-запрос к странице товара через прокси."""
+    url = f"https://www.ozon.ru/product/{sku}/"
     connector = create_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
         for attempt in range(1, retries + 1):
             try:
-                logger.info(f"API попытка {attempt} для SKU {sku} через прокси")
-                async with session.post(url, json=payload, headers=API_HEADERS, timeout=30) as resp:
+                logger.info(f"HTML попытка {attempt} для SKU {sku}")
+                async with session.get(url, headers=HTML_HEADERS, timeout=60) as resp:
                     if resp.status != 200:
                         raise Exception(f"HTTP {resp.status}")
-                    data = await resp.json()
-                    sellers = []
-                    offers = data.get("offers", []) or data.get("product", {}).get("offers", [])
-                    for offer in offers:
-                        seller_name = offer.get("sellerName") or offer.get("seller", {}).get("name")
-                        price = offer.get("price") or offer.get("priceValue")
-                        if seller_name and price:
-                            sellers.append({
-                                "name": seller_name,
-                                "price": str(price),
-                                "sku": offer.get("sku") or offer.get("sellerSku"),
-                                "link": f"https://www.ozon.ru/product/{sku}/"
-                            })
-                    if sellers:
-                        return sellers
-                    else:
-                        # Возможно, у товара нет конкурентов
-                        return []
+                    return await resp.text()
             except asyncio.TimeoutError:
-                logger.warning(f"API таймаут для SKU {sku}, попытка {attempt}")
-                if attempt == retries:
-                    raise Exception("Таймаут при запросе к API")
-                await asyncio.sleep(2 ** attempt)
-            except Exception as e:
-                logger.error(f"API ошибка для SKU {sku}: {e}")
+                logger.warning(f"HTML таймаут, попытка {attempt}")
                 if attempt == retries:
                     raise
-                await asyncio.sleep(2 ** attempt)
-    return []
+                await asyncio.sleep(3 ** attempt)
+            except Exception as e:
+                logger.error(f"HTML ошибка: {e}")
+                if attempt == retries:
+                    raise
+                await asyncio.sleep(3 ** attempt)
+    return None
 
-async def fetch_competitors_html(sku: str):
-    url = f"https://www.ozon.ru/product/{sku}/"
+async def fetch_api(sku: str, retries: int = 3):
+    """POST-запрос к API через прокси."""
+    url = "https://www.ozon.ru/api/composer-api.bx/_action/getProduct"
+    payload = {"productId": sku, "layout": "default", "showAll": False}
     connector = create_connector()
     async with aiohttp.ClientSession(connector=connector) as session:
-        async with session.get(url, headers=BASE_HEADERS, timeout=30) as resp:
-            if resp.status != 200:
-                raise Exception(f"HTML HTTP {resp.status}")
-            html = await resp.text()
+        for attempt in range(1, retries + 1):
+            try:
+                logger.info(f"API попытка {attempt} для SKU {sku}")
+                async with session.post(url, json=payload, headers=API_HEADERS, timeout=60) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"HTTP {resp.status}")
+                    return await resp.json()
+            except asyncio.TimeoutError:
+                logger.warning(f"API таймаут, попытка {attempt}")
+                if attempt == retries:
+                    raise
+                await asyncio.sleep(3 ** attempt)
+            except Exception as e:
+                logger.error(f"API ошибка: {e}")
+                if attempt == retries:
+                    raise
+                await asyncio.sleep(3 ** attempt)
+    return None
 
+def parse_html(html: str, sku: str):
+    """Парсит HTML-страницу и извлекает продавцов."""
     soup = BeautifulSoup(html, "lxml")
     sellers = []
+    # Пробуем селекторы
     price_blocks = soup.select('[data-widget="webPrice"] [data-qa="price-block"]')
     if not price_blocks:
         price_blocks = soup.select('.c6a0, .c9a0')
-
     for block in price_blocks:
         seller_elem = block.find(attrs={"data-qa": "seller-name"}) or block.find(class_="seller-link")
         if not seller_elem:
@@ -154,9 +150,8 @@ async def fetch_competitors_html(sku: str):
                 "name": seller_name,
                 "price": price_digits,
                 "sku": None,
-                "link": url
+                "link": f"https://www.ozon.ru/product/{sku}/"
             })
-
     # Убираем дубли
     seen = set()
     unique = []
@@ -166,20 +161,48 @@ async def fetch_competitors_html(sku: str):
             unique.append(s)
     return unique
 
+def parse_api(data: dict, sku: str):
+    """Парсит JSON-ответ API."""
+    sellers = []
+    offers = data.get("offers", []) or data.get("product", {}).get("offers", [])
+    for offer in offers:
+        seller_name = offer.get("sellerName") or offer.get("seller", {}).get("name")
+        price = offer.get("price") or offer.get("priceValue")
+        if seller_name and price:
+            sellers.append({
+                "name": seller_name,
+                "price": str(price),
+                "sku": offer.get("sku") or offer.get("sellerSku"),
+                "link": f"https://www.ozon.ru/product/{sku}/"
+            })
+    return sellers
+
 async def fetch_competitors(sku: str):
-    """Сначала API, если пусто или ошибка – HTML."""
+    """Сначала пробуем HTML (GET), если нет – API (POST)."""
+    # Попытка HTML
     try:
-        sellers = await fetch_competitors_api(sku)
-        if sellers:
-            return sellers
-        logger.info(f"API вернул пусто для {sku}, пробуем HTML")
-        return await fetch_competitors_html(sku)
+        html = await fetch_html(sku)
+        if html:
+            sellers = parse_html(html, sku)
+            if sellers:
+                return sellers
+            logger.info(f"HTML не дал продавцов для {sku}")
     except Exception as e:
-        logger.warning(f"API не удался для {sku}: {e}, пробуем HTML")
-        try:
-            return await fetch_competitors_html(sku)
-        except Exception as e2:
-            raise Exception(f"Не удалось получить данные ни через API, ни через HTML: {e2}")
+        logger.warning(f"HTML не удался для {sku}: {e}")
+
+    # Если HTML не помог, пробуем API
+    try:
+        data = await fetch_api(sku)
+        if data:
+            sellers = parse_api(data, sku)
+            if sellers:
+                return sellers
+            logger.info(f"API не дал продавцов для {sku}")
+    except Exception as e:
+        logger.warning(f"API не удался для {sku}: {e}")
+
+    # Если ничего не помогло
+    raise Exception("Не удалось получить данные ни через HTML, ни через API")
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
