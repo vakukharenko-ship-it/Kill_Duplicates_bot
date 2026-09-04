@@ -343,7 +343,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ (исправленные) ----------
+# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
 def fetch_finance_transactions(date_from, date_to):
     """
     Получает все финансовые транзакции за указанный период.
@@ -494,8 +494,14 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
             short_name = "Возвраты"
         elif "Обработка" in category:
             short_name = "Обработка"
+        elif "Подписка" in category:
+            short_name = "Подписка"
+        elif "Упаковка" in category:
+            short_name = "Упаковка"
+        elif "Обеспечение" in category:
+            short_name = "Обеспечение упаковкой"
         else:
-            short_name = category[:40]  # обрезаем длинные названия
+            short_name = category[:40]
 
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
@@ -807,13 +813,13 @@ def generate_sales_chart(years_list):
     plt.close(fig)
     return buf
 
-# ---------- Форматирование одиночных отчётов ----------
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ (исправленные) ----------
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     has_data = False
     for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense"]:
+        if key in ["drr", "effective_drr", "ad_expense", "expenses"]:
             continue
         if isinstance(val, (int, float)) and val != 0:
             has_data = True
@@ -827,7 +833,7 @@ def format_single_metrics(metrics, title):
     drr_text = f"{drr:.2f}%" if drr is not None else "∞"
     eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
-    return (
+    main_text = (
         f"📊 *{title}*\n\n"
         f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
         f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
@@ -840,6 +846,14 @@ def format_single_metrics(metrics, title):
         f"  ДРР (общий): {drr_text}\n"
         f"  ДРР (по доставленным): {eff_drr_text}"
     )
+
+    # Блок расходов (финансовые транзакции)
+    expenses = metrics.get("expenses", {})
+    if expenses:
+        expense_block = format_expense_block(expenses, "Расходы за период", previous_expenses=None)
+        main_text += "\n\n" + expense_block
+
+    return main_text
 
 def get_metrics_for_date(date_str):
     today = get_moscow_today()
@@ -860,6 +874,11 @@ def get_metrics_for_date(date_str):
         metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
     else:
         metrics["effective_drr"] = None
+
+    # Финансовые расходы за дату
+    expenses = aggregate_finance_expenses(fetch_finance_transactions(date_str, date_str))
+    metrics["expenses"] = expenses
+
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
@@ -888,6 +907,11 @@ def get_metrics_for_period(date_from, date_to):
         total["effective_drr"] = (ad_expense / delivered_revenue) * 100
     else:
         total["effective_drr"] = None
+
+    # Финансовые расходы за период
+    expenses = aggregate_finance_expenses(fetch_finance_transactions(date_from, date_to))
+    total["expenses"] = expenses
+
     return total
 
 # ---------- КЛАВИАТУРЫ ----------
