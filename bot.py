@@ -343,7 +343,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ (С РАСШИРЕННЫМ ЛОГИРОВАНИЕМ) ----------
+# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
 def fetch_finance_transactions(date_from, date_to):
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
@@ -365,7 +365,6 @@ def fetch_finance_transactions(date_from, date_to):
     all_transactions = []
     page = 1
     page_size = 1000
-    first_response_logged = False
 
     while True:
         payload = {
@@ -389,11 +388,6 @@ def fetch_finance_transactions(date_from, date_to):
 
             response.raise_for_status()
             data = response.json()
-
-            if not first_response_logged:
-                write_log(f"🔍 Первый ответ Finance API: {json.dumps(data, ensure_ascii=False)[:1500]}")
-                first_response_logged = True
-
             items = data.get("result", {}).get("operations", [])
             if not items:
                 break
@@ -421,12 +415,13 @@ def aggregate_finance_expenses(transactions):
     sample_count = 0
     for t in transactions:
         amount = t.get("amount", 0)
+        if sample_count < 10:
+            services = t.get("services", [])
+            if services:
+                write_log(f"🔍 Пример транзакции: amount={amount}, operation_type={t.get('operation_type_name')}, services={json.dumps(services, ensure_ascii=False)}")
+                sample_count += 1
         if amount >= 0:
             continue
-        # Логируем первые 10 расходных транзакций полностью
-        if sample_count < 10:
-            write_log(f"🔍 Расход №{sample_count+1}: amount={amount}, operation_type={t.get('operation_type_name')}, services={json.dumps(t.get('services', []), ensure_ascii=False)}")
-            sample_count += 1
         op_type = t.get("operation_type_name", "Неизвестный тип")
         unique_types.add(op_type)
         services = t.get("services", [])
@@ -460,47 +455,37 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
 
-    # Группируем по сокращённым названиям
-    grouped = {}
-    for category, amount in expenses_by_type.items():
-        short_name = category
-        if "Комиссия" in category:
-            short_name = "Комиссия"
-        elif "Логистика" in category or "Доставка" in category:
-            short_name = "Логистика"
-        elif "Эквайринг" in category:
-            short_name = "Эквайринг"
-        elif "Кросс-докинг" in category:
-            short_name = "Кросс-докинг"
-        elif "Хранение" in category:
-            short_name = "Хранение"
-        elif "Возврат" in category:
-            short_name = "Возвраты"
-        elif "Обработка" in category:
-            short_name = "Обработка"
-        elif "Подписка" in category:
-            short_name = "Подписка"
-        elif "Упаковка" in category:
-            short_name = "Упаковка"
-        elif "Обеспечение" in category:
-            short_name = "Обеспечение упаковкой"
-        elif "Страхование" in category:
-            short_name = "Страхование"
-        elif "Вознаграждение" in category:
-            short_name = "Вознаграждение Ozon"
-        elif "Потеря" in category:
-            short_name = "Потери"
-        elif "Утилизация" in category:
-            short_name = "Утилизация"
-        else:
-            short_name = category[:40]
-        grouped[short_name] = grouped.get(short_name, 0) + amount
-
-    total = sum(grouped.values())
+    total = sum(expenses_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
 
-    sorted_items = sorted(grouped.items(), key=lambda x: x[1], reverse=True)
-    for short_name, amount in sorted_items:
+    sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
+
+    for category, amount in sorted_items:
+        # Делаем короткое имя для читаемости, но НЕ объединяем разные категории
+        short_name = category
+        if category == "Доставка покупателю":
+            short_name = "Доставка покупателю"
+        elif category == "Доставка и обработка возврата, отмены, невыкупа":
+            short_name = "Доставка/возвраты"
+        elif category == "Оплата эквайринга":
+            short_name = "Эквайринг"
+        elif category == "Кросс-докинг":
+            short_name = "Кросс-докинг"
+        elif category == "Страхование товара от массовых повреждений":
+            short_name = "Страхование"
+        elif category == "Обеспечение материалами для упаковки товара":
+            short_name = "Обеспечение упаковкой"
+        elif category == "Упаковка товара партнёрами":
+            short_name = "Упаковка"
+        elif category == "Подписка Управление отзывами":
+            short_name = "Подписка"
+        elif category == "Оплата за клик":
+            short_name = "Оплата за клик"
+        elif category == "Получение возврата, отмены, невыкупа от покупателя":
+            short_name = "Получение возвратов"
+        else:
+            short_name = category[:40]
+
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
     if previous_expenses is not None:
