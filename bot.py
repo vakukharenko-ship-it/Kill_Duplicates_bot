@@ -465,6 +465,7 @@ def aggregate_finance_expenses(transactions):
 
     return expense_by_type
 
+# ---------- ИСПРАВЛЕННАЯ ФУНКЦИЯ format_expense_block ----------
 def format_expense_block(expenses_by_type, title, previous_expenses=None):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
@@ -472,7 +473,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
     total = sum(expenses_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
 
-    # Полный словарь перевода технических названий на русский
+    # Расширенный словарь перевода
     name_map = {
         # Основные группы из таблицы
         "Комиссия Ozon": "Комиссия",
@@ -525,11 +526,11 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
 
     for category, amount in sorted_items:
-        # Сначала ищем точное совпадение в словаре
+        # Сначала ищем точное совпадение
         if category in name_map:
             short_name = name_map[category]
         else:
-            # Если нет точного, пробуем найти частичное совпадение
+            # Пытаемся найти частичное совпадение по ключевым словам
             found = False
             for key, value in name_map.items():
                 if key in category or category in key:
@@ -537,7 +538,10 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
                     found = True
                     break
             if not found:
-                short_name = category[:40]  # обрезаем длинные названия
+                # Если ничего не подошло, оставляем как есть, но обрезаем до 40 символов
+                short_name = category[:40]
+                # Логируем нераспознанную категорию для отладки
+                write_log(f"⚠️ Не найдено соответствие для категории: {category}")
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
     if previous_expenses is not None:
