@@ -315,7 +315,11 @@ def fetch_advertising_expense_single(date_from, date_to):
             response = requests.get(url, headers=headers, params=params, timeout=15)
 
         if response.status_code == 400:
-            write_log(f"⚠️ Performance API вернул 400 для {date_from}–{date_to}: {response.text[:200]}")
+            error_text = response.text
+            if "interval of report is in the future" in error_text:
+                write_log(f"⏭️ Пропускаем будущий период: {date_from}–{date_to}")
+            else:
+                write_log(f"⚠️ Performance API вернул 400 для {date_from}–{date_to}: {error_text[:200]}")
             return 0.0
 
         response.raise_for_status()
@@ -344,9 +348,17 @@ def fetch_advertising_expense_single(date_from, date_to):
 def fetch_advertising_expense(date_from, date_to):
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
+    today = get_moscow_today()
+    # Если дата начала позже сегодня – пропускаем
+    if start_dt.date() > today:
+        return 0.0
+    # Обрезаем конечную дату до сегодня, если она в будущем
+    if end_dt.date() > today:
+        end_dt = datetime.datetime.combine(today, datetime.time(23, 59, 59))
+
     delta = (end_dt - start_dt).days
     if delta <= 90:
-        return fetch_advertising_expense_single(date_from, date_to)
+        return fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
 
     total = 0.0
     current = start_dt.replace(day=1)
@@ -354,8 +366,10 @@ def fetch_advertising_expense(date_from, date_to):
         month_start = current.strftime("%Y-%m-%d")
         next_month = current.replace(day=28) + datetime.timedelta(days=4)
         month_end = (next_month - datetime.timedelta(days=next_month.day)).strftime("%Y-%m-%d")
-        if month_end > date_to:
-            month_end = date_to
+        if month_end > end_dt.strftime("%Y-%m-%d"):
+            month_end = end_dt.strftime("%Y-%m-%d")
+        if current.date() > today:
+            break
         write_log(f"📊 Запрос рекламы за {month_start}–{month_end}")
         total += fetch_advertising_expense_single(month_start, month_end)
         current = current.replace(day=28) + datetime.timedelta(days=4)
@@ -430,9 +444,15 @@ def fetch_finance_transactions_single(date_from, date_to):
 def fetch_finance_transactions(date_from, date_to):
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
+    today = get_moscow_today()
+    if start_dt.date() > today:
+        return []
+    if end_dt.date() > today:
+        end_dt = datetime.datetime.combine(today, datetime.time(23, 59, 59))
+
     delta = (end_dt - start_dt).days
     if delta <= 90:
-        return fetch_finance_transactions_single(date_from, date_to)
+        return fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
 
     all_transactions = []
     current = start_dt.replace(day=1)
@@ -440,8 +460,10 @@ def fetch_finance_transactions(date_from, date_to):
         month_start = current.strftime("%Y-%m-%d")
         next_month = current.replace(day=28) + datetime.timedelta(days=4)
         month_end = (next_month - datetime.timedelta(days=next_month.day)).strftime("%Y-%m-%d")
-        if month_end > date_to:
-            month_end = date_to
+        if month_end > end_dt.strftime("%Y-%m-%d"):
+            month_end = end_dt.strftime("%Y-%m-%d")
+        if current.date() > today:
+            break
         write_log(f"💰 Запрос финансов за {month_start}–{month_end}")
         all_transactions.extend(fetch_finance_transactions_single(month_start, month_end))
         current = current.replace(day=28) + datetime.timedelta(days=4)
@@ -469,12 +491,10 @@ def aggregate_finance_expenses(transactions):
                 write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, services={json.dumps(services, ensure_ascii=False)}")
                 sample_count += 1
 
-        # Комиссия (всегда расход, даже если amount положительный? Обычно отрицательная)
         sale_comm = t.get("sale_commission", 0)
         if sale_comm < 0:
             expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
 
-        # Доставка и возвраты – отдельные поля, обычно отрицательные, но проверим
         delivery_charge = t.get("delivery_charge", 0)
         if delivery_charge < 0:
             expense_by_type["Доставка (отдельно)"] = expense_by_type.get("Доставка (отдельно)", 0) + abs(delivery_charge)
@@ -510,7 +530,6 @@ def aggregate_finance_expenses(transactions):
                 elif service_amount > 0:
                     has_positive_service = True
                     income_by_type[service_name] = income_by_type.get(service_name, 0) + service_amount
-            # Если в services не было отрицательных, но amount отрицательный, то добавим op_type
             if not has_negative_service and amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
             if not has_positive_service and amount > 0:
@@ -541,6 +560,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
 
     name_map = {
+        # Основные группы из таблицы
         "Комиссия Ozon": "Комиссия",
         "Оплата эквайринга": "Эквайринг",
         "Доставка покупателю": "Доставка покупателю",
@@ -552,6 +572,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "Подписка Управление отзывами": "Подписка",
         "Оплата за клик": "Оплата за клик",
         "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
+        # Технические имена из services (добавляем все, что встречались)
         "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
         "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
         "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
@@ -564,13 +585,23 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля (ПВЗ)",
         "MarketplaceServiceItemDirectFlowLogisticFBS": "Логистика прямая (FBS)",
         "MarketplaceServiceItemReturnFlowLogisticFBS": "Логистика возврат (FBS)",
+        "ItemAgentServiceStarsMembership": "Звёздные товары",
+        "MarketplaceServiceSellerReturnsCargoAssortment": "Обработка возвратов партнёрами",
+        "MarketplaceServiceItemTemporaryStorageRedistribution": "Временное размещение",
+        "MarketplaceServiceProductMovementFromWarehouse": "Вывоз до ПВЗ",
+        "MarketplaceServiceItemDisposalDetailed": "Утилизация",
+        # Услуги FBO и другие
         "Звёздные товары": "Звёздные товары",
         "Временное размещение товара партнерами": "Временное размещение",
         "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
+        "Обработка товара в составе грузоместа на FBO": "Поштучная приёмка",
         "Подготовка товара к вывозу: Брак": "Подготовка к вывозу (брак)",
         "Вывоз товара со склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
+        "Вывоз товара со Склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
         "Бронирование места и персонала для поставки с неполным составом в составе грузоместа": "Бронирование места",
+        "Услуга по бронированию места и персонала для поставки с неполным составом в составе ГМ": "Бронирование места",
         "Обработка опознанных излишков в составе грузоместа": "Обработка излишков",
+        "Услуга по обработке опознанных излишков в составе ГМ": "Обработка излишков",
         "Утилизация товара: Пролились/просыпались из-за упаковки": "Утилизация",
         "Потеря по вине Ozon на складе": "Потеря (склад)",
         "Потеря по вине Ozon в логистике": "Потеря (логистика)",
@@ -616,7 +647,7 @@ def format_income_block(income_by_type, title, previous_incomes=None):
     total = sum(income_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого доходов:* {total:,.2f} ₽"]
 
-    # Используем тот же словарь, но для доходов
+    # Используем тот же словарь, что и для расходов (он уже полный)
     name_map = {
         "Комиссия Ozon": "Комиссия",
         "Оплата эквайринга": "Эквайринг",
@@ -641,13 +672,22 @@ def format_income_block(income_by_type, title, previous_incomes=None):
         "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля (ПВЗ)",
         "MarketplaceServiceItemDirectFlowLogisticFBS": "Логистика прямая (FBS)",
         "MarketplaceServiceItemReturnFlowLogisticFBS": "Логистика возврат (FBS)",
+        "ItemAgentServiceStarsMembership": "Звёздные товары",
+        "MarketplaceServiceSellerReturnsCargoAssortment": "Обработка возвратов партнёрами",
+        "MarketplaceServiceItemTemporaryStorageRedistribution": "Временное размещение",
+        "MarketplaceServiceProductMovementFromWarehouse": "Вывоз до ПВЗ",
+        "MarketplaceServiceItemDisposalDetailed": "Утилизация",
         "Звёздные товары": "Звёздные товары",
         "Временное размещение товара партнерами": "Временное размещение",
         "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
+        "Обработка товара в составе грузоместа на FBO": "Поштучная приёмка",
         "Подготовка товара к вывозу: Брак": "Подготовка к вывозу (брак)",
         "Вывоз товара со склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
+        "Вывоз товара со Склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
         "Бронирование места и персонала для поставки с неполным составом в составе грузоместа": "Бронирование места",
+        "Услуга по бронированию места и персонала для поставки с неполным составом в составе ГМ": "Бронирование места",
         "Обработка опознанных излишков в составе грузоместа": "Обработка излишков",
+        "Услуга по обработке опознанных излишков в составе ГМ": "Обработка излишков",
         "Утилизация товара: Пролились/просыпались из-за упаковки": "Утилизация",
         "Потеря по вине Ozon на складе": "Потеря (склад)",
         "Потеря по вине Ozon в логистике": "Потеря (логистика)",
