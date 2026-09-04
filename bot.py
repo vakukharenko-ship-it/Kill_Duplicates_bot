@@ -849,7 +849,7 @@ def generate_sales_chart(years_list):
     plt.close(fig)
     return buf
 
-# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ (исправлены) ----------
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -883,10 +883,10 @@ def format_single_metrics(metrics, title):
         f"  ДРР (по доставленным): {eff_drr_text}"
     )
 
+    # Блок расходов выводится всегда, даже если expenses пустой
     expenses = metrics.get("expenses", {})
-    if expenses:
-        expense_block = format_expense_block(expenses, "Расходы за период", previous_expenses=None)
-        main_text += "\n\n" + expense_block
+    expense_block = format_expense_block(expenses, "Расходы за период", previous_expenses=None)
+    main_text += "\n\n" + expense_block
 
     return main_text
 
@@ -915,6 +915,7 @@ def get_metrics_for_date(date_str):
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
+    write_log(f"📊 Запрос метрик за период: {date_from} – {date_to}")
     postings = fetch_postings(date_from, date_to)
     agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
     total = {
@@ -929,6 +930,7 @@ def get_metrics_for_period(date_from, date_to):
         for key in total:
             total[key] += vals.get(key, 0)
     ad_expense = fetch_advertising_expense(date_from, date_to)
+    write_log(f"📢 Рекламные расходы за период: {ad_expense}")
     total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
     revenue = total.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
