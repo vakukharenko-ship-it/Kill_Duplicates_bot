@@ -412,9 +412,15 @@ def aggregate_finance_expenses(transactions):
     expense_by_type = {}
     unique_types = set()
     unique_services = set()
-
+    sample_count = 0
     for t in transactions:
         amount = t.get("amount", 0)
+        # Логируем примеры транзакций с services
+        if sample_count < 3:
+            services = t.get("services", [])
+            if services:
+                write_log(f"🔍 Пример транзакции: amount={amount}, operation_type={t.get('operation_type_name')}, services={json.dumps(services, ensure_ascii=False)}")
+                sample_count += 1
         if amount >= 0:
             continue
 
