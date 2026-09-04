@@ -262,7 +262,7 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
 
     return aggregated
 
-# ---------- Функции для получения рекламных расходов (Performance) ----------
+# ---------- Функции для получения рекламных расходов (Performance) с разбивкой по месяцам ----------
 def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -293,10 +293,10 @@ def get_performance_token():
         write_log(f"❌ Ошибка при запросе токена: {e}")
         return None
 
-def fetch_advertising_expense(date_from, date_to):
+def fetch_advertising_expense_single(date_from, date_to):
+    """Запрашивает рекламные расходы за один период (не более месяца)"""
     token = get_performance_token()
     if not token:
-        write_log("⚠️ Не удалось получить токен. Рекламные расходы не будут отображаться.")
         return 0.0
 
     url = "https://api-performance.ozon.ru/api/client/statistics/expense/json"
@@ -304,11 +304,10 @@ def fetch_advertising_expense(date_from, date_to):
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
-    start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d") - datetime.timedelta(days=1)
-    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1)
+    # Для API performance не нужно добавлять +/- день, просто передаём даты как есть
     params = {
-        "dateFrom": start_dt.strftime("%Y-%m-%d"),
-        "dateTo": end_dt.strftime("%Y-%m-%d"),
+        "dateFrom": date_from,
+        "dateTo": date_to,
     }
     try:
         response = requests.get(url, headers=headers, params=params, timeout=15)
@@ -317,11 +316,12 @@ def fetch_advertising_expense(date_from, date_to):
             time.sleep(10)
             response = requests.get(url, headers=headers, params=params, timeout=15)
 
-        write_log(f"📥 Статус ответа Performance API: {response.status_code}")
+        if response.status_code == 400:
+            write_log(f"⚠️ Performance API вернул 400 для {date_from}–{date_to}: {response.text[:200]}")
+            return 0.0
+
         response.raise_for_status()
         data = response.json()
-        write_log(f"📥 Ответ Performance API (расширенный): {json.dumps(data, ensure_ascii=False)[:500]}")
-
         total_expense = 0.0
         if isinstance(data, dict) and "rows" in data:
             rows = data["rows"]
@@ -343,15 +343,41 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
-def fetch_finance_transactions(date_from, date_to):
+def fetch_advertising_expense(date_from, date_to):
+    """
+    Получает рекламные расходы за период, разбивая на месяцы, если период большой.
+    """
+    # Если период не более 3 месяцев, запрашиваем сразу
+    start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
+    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
+    delta = (end_dt - start_dt).days
+    if delta <= 90:
+        return fetch_advertising_expense_single(date_from, date_to)
+
+    # Разбиваем по месяцам
+    total = 0.0
+    current = start_dt.replace(day=1)
+    while current <= end_dt:
+        month_start = current.strftime("%Y-%m-%d")
+        # последний день месяца
+        next_month = current.replace(day=28) + datetime.timedelta(days=4)
+        month_end = (next_month - datetime.timedelta(days=next_month.day)).strftime("%Y-%m-%d")
+        if month_end > date_to:
+            month_end = date_to
+        write_log(f"📊 Запрос рекламы за {month_start}–{month_end}")
+        total += fetch_advertising_expense_single(month_start, month_end)
+        current = current.replace(day=28) + datetime.timedelta(days=4)
+        current = current.replace(day=1)
+    return total
+
+# ---------- Функции для финансовых транзакций с разбивкой по месяцам ----------
+def fetch_finance_transactions_single(date_from, date_to):
+    """Запрашивает финансовые транзакции за один период (не более месяца)"""
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
-        write_log(f"⏭️ Пропуск запроса: date_from ({date_from}) > today ({today_str})")
         return []
     if date_to > today_str:
         date_to = today_str
-        write_log(f"⏭️ Обрезан date_to до {date_to} (сегодня)")
 
     headers = {
         "Client-Id": OZON_CLIENT_ID,
@@ -379,12 +405,15 @@ def fetch_finance_transactions(date_from, date_to):
         }
 
         try:
-            write_log(f"🔍 Запрос finance (page={page}): {json.dumps(payload)}")
             response = requests.post(OZON_FINANCE_URL, headers=headers, json=payload, timeout=15)
 
             if response.status_code == 429:
                 time.sleep(10)
                 continue
+
+            if response.status_code == 400:
+                write_log(f"⚠️ Finance API вернул 400 для {date_from}–{date_to}: {response.text[:200]}")
+                break
 
             response.raise_for_status()
             data = response.json()
@@ -405,9 +434,35 @@ def fetch_finance_transactions(date_from, date_to):
             write_log(f"❌ Ошибка получения финансовых транзакций: {e}")
             break
 
-    write_log(f"💰 Загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
 
+def fetch_finance_transactions(date_from, date_to):
+    """
+    Получает финансовые транзакции за период, разбивая на месяцы, если период большой.
+    """
+    start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
+    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
+    delta = (end_dt - start_dt).days
+    if delta <= 90:
+        return fetch_finance_transactions_single(date_from, date_to)
+
+    all_transactions = []
+    current = start_dt.replace(day=1)
+    while current <= end_dt:
+        month_start = current.strftime("%Y-%m-%d")
+        next_month = current.replace(day=28) + datetime.timedelta(days=4)
+        month_end = (next_month - datetime.timedelta(days=next_month.day)).strftime("%Y-%m-%d")
+        if month_end > date_to:
+            month_end = date_to
+        write_log(f"💰 Запрос финансов за {month_start}–{month_end}")
+        all_transactions.extend(fetch_finance_transactions_single(month_start, month_end))
+        current = current.replace(day=28) + datetime.timedelta(days=4)
+        current = current.replace(day=1)
+
+    write_log(f"💰 Всего загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
+    return all_transactions
+
+# ---------- Остальные функции (агрегация, форматирование и т.д.) ----------
 def aggregate_finance_expenses(transactions):
     expense_by_type = {}
     unique_types = set()
@@ -465,7 +520,6 @@ def aggregate_finance_expenses(transactions):
 
     return expense_by_type
 
-# ---------- ИСПРАВЛЕННАЯ ФУНКЦИЯ format_expense_block ----------
 def format_expense_block(expenses_by_type, title, previous_expenses=None):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
@@ -473,9 +527,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
     total = sum(expenses_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
 
-    # Расширенный словарь перевода
     name_map = {
-        # Основные группы из таблицы
         "Комиссия Ozon": "Комиссия",
         "Оплата эквайринга": "Эквайринг",
         "Доставка покупателю": "Доставка покупателю",
@@ -487,7 +539,6 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "Подписка Управление отзывами": "Подписка",
         "Оплата за клик": "Оплата за клик",
         "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
-        # Технические имена из services
         "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
         "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
         "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
@@ -497,28 +548,21 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "MarketplaceServiceItemPackageRedistribution": "Переупаковка",
         "MarketplaceServiceItemPackageMaterialsProvision": "Обеспечение упаковкой",
         "MarketplaceServiceItemProductReviewsManagementSubscription": "Подписка",
-        # Дополнительные, если появятся
         "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля (ПВЗ)",
         "MarketplaceServiceItemDirectFlowLogisticFBS": "Логистика прямая (FBS)",
         "MarketplaceServiceItemReturnFlowLogisticFBS": "Логистика возврат (FBS)",
-        # Услуги партнёров
         "Звёздные товары": "Звёздные товары",
         "Временное размещение товара партнерами": "Временное размещение",
-        # Услуги FBO
         "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
         "Подготовка товара к вывозу: Брак": "Подготовка к вывозу (брак)",
         "Вывоз товара со склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
         "Бронирование места и персонала для поставки с неполным составом в составе грузоместа": "Бронирование места",
         "Обработка опознанных излишков в составе грузоместа": "Обработка излишков",
-        # Другие услуги и штрафы
         "Утилизация товара: Пролились/просыпались из-за упаковки": "Утилизация",
-        # Компенсации и декомпенсации
         "Потеря по вине Ozon на складе": "Потеря (склад)",
         "Потеря по вине Ozon в логистике": "Потеря (логистика)",
-        # Вознаграждение Ozon
         "Вознаграждение за продажу": "Вознаграждение",
         "Возврат вознаграждения": "Возврат вознаграждения",
-        # Продажи (доходы, но могут быть и расходы)
         "Программы партнёров": "Программы партнёров",
         "Баллы за скидки": "Баллы за скидки",
     }
@@ -526,11 +570,9 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
 
     for category, amount in sorted_items:
-        # Сначала ищем точное совпадение
         if category in name_map:
             short_name = name_map[category]
         else:
-            # Пытаемся найти частичное совпадение по ключевым словам
             found = False
             for key, value in name_map.items():
                 if key in category or category in key:
@@ -538,9 +580,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
                     found = True
                     break
             if not found:
-                # Если ничего не подошло, оставляем как есть, но обрезаем до 40 символов
                 short_name = category[:40]
-                # Логируем нераспознанную категорию для отладки
                 write_log(f"⚠️ Не найдено соответствие для категории: {category}")
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
@@ -849,7 +889,7 @@ def generate_sales_chart(years_list):
     plt.close(fig)
     return buf
 
-# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ (исправлены) ----------
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -883,10 +923,10 @@ def format_single_metrics(metrics, title):
         f"  ДРР (по доставленным): {eff_drr_text}"
     )
 
-    # Блок расходов выводится всегда, даже если expenses пустой
     expenses = metrics.get("expenses", {})
-    expense_block = format_expense_block(expenses, "Расходы за период", previous_expenses=None)
-    main_text += "\n\n" + expense_block
+    if expenses:
+        expense_block = format_expense_block(expenses, "Расходы за период", previous_expenses=None)
+        main_text += "\n\n" + expense_block
 
     return main_text
 
@@ -915,7 +955,6 @@ def get_metrics_for_date(date_str):
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
-    write_log(f"📊 Запрос метрик за период: {date_from} – {date_to}")
     postings = fetch_postings(date_from, date_to)
     agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
     total = {
@@ -930,7 +969,6 @@ def get_metrics_for_period(date_from, date_to):
         for key in total:
             total[key] += vals.get(key, 0)
     ad_expense = fetch_advertising_expense(date_from, date_to)
-    write_log(f"📢 Рекламные расходы за период: {ad_expense}")
     total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
     revenue = total.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
