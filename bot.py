@@ -343,7 +343,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
+# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ (ИСПРАВЛЕННЫЕ) ----------
 def fetch_finance_transactions(date_from, date_to):
     """
     Получает все финансовые транзакции за указанный период.
@@ -424,9 +424,9 @@ def aggregate_finance_expenses(transactions):
     """
     Агрегирует расходы из транзакций.
     Возвращает словарь {категория: сумма} для всех расходов (amount < 0).
-    Если есть услуги (services), использует их названия.
-    Иначе использует operation_type_name.
-    Также логирует все найденные уникальные категории.
+    Если есть услуги (services) с отрицательными суммами, использует их названия.
+    Если в services нет отрицательных сумм, использует operation_type_name.
+    Если services отсутствуют, использует operation_type_name.
     """
     expense_by_type = {}
     unique_types = set()
@@ -442,13 +442,20 @@ def aggregate_finance_expenses(transactions):
 
         services = t.get("services", [])
         if services and isinstance(services, list):
+            has_negative_service = False
             for service in services:
                 service_name = service.get("name", "Неизвестная услуга")
                 service_amount = service.get("amount", 0)
                 if service_amount < 0:
+                    has_negative_service = True
                     unique_services.add(service_name)
                     expense = abs(service_amount)
                     expense_by_type[service_name] = expense_by_type.get(service_name, 0) + expense
+            # Если в services не было отрицательных сумм, но сама транзакция расходная,
+            # то используем operation_type_name (сумма amount)
+            if not has_negative_service:
+                expense = abs(amount)
+                expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
         else:
             # Нет services, используем operation_type_name
             expense = abs(amount)
@@ -500,6 +507,8 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
             short_name = "Упаковка"
         elif "Обеспечение" in category:
             short_name = "Обеспечение упаковкой"
+        elif "Страхование" in category:
+            short_name = "Страхование"
         else:
             short_name = category[:40]
 
