@@ -409,38 +409,66 @@ def fetch_finance_transactions(date_from, date_to):
     return all_transactions
 
 def aggregate_finance_expenses(transactions):
+    """
+    Агрегирует расходы из транзакций.
+    Учитывает:
+    - отрицательные amount (общая сумма)
+    - отрицательные services (детализация)
+    - отрицательные sale_commission (комиссия)
+    - отрицательные delivery_charge, return_delivery_charge (если есть)
+    """
     expense_by_type = {}
     unique_types = set()
     unique_services = set()
     sample_count = 0
     for t in transactions:
-        amount = t.get("amount", 0)
+        # Логируем несколько примеров для отладки
         if sample_count < 10:
             services = t.get("services", [])
             if services:
-                write_log(f"🔍 Пример транзакции: amount={amount}, operation_type={t.get('operation_type_name')}, services={json.dumps(services, ensure_ascii=False)}")
+                write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, services={json.dumps(services, ensure_ascii=False)}")
                 sample_count += 1
-        if amount >= 0:
-            continue
+
+        # 1. Обработка sale_commission (комиссия)
+        sale_comm = t.get("sale_commission", 0)
+        if sale_comm < 0:
+            expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
+
+        # 2. Обработка delivery_charge и return_delivery_charge (если есть)
+        delivery_charge = t.get("delivery_charge", 0)
+        if delivery_charge < 0:
+            expense_by_type["Доставка (отдельно)"] = expense_by_type.get("Доставка (отдельно)", 0) + abs(delivery_charge)
+
+        return_delivery = t.get("return_delivery_charge", 0)
+        if return_delivery < 0:
+            expense_by_type["Возвратная доставка"] = expense_by_type.get("Возвратная доставка", 0) + abs(return_delivery)
+
+        # 3. Обработка основного amount и services
+        amount = t.get("amount", 0)
         op_type = t.get("operation_type_name", "Неизвестный тип")
-        unique_types.add(op_type)
+        if amount < 0:
+            unique_types.add(op_type)
+
         services = t.get("services", [])
         if services and isinstance(services, list):
             has_negative_service = False
             for service in services:
                 service_name = service.get("name", "Неизвестная услуга")
-                service_amount = service.get("amount", 0)
+                service_amount = service.get("price", 0)  # в services сумма в поле price
+                # Также может быть amount, проверим оба
+                if service_amount == 0:
+                    service_amount = service.get("amount", 0)
                 if service_amount < 0:
                     has_negative_service = True
                     unique_services.add(service_name)
                     expense = abs(service_amount)
                     expense_by_type[service_name] = expense_by_type.get(service_name, 0) + expense
-            if not has_negative_service:
-                expense = abs(amount)
-                expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
+            # Если в services не было отрицательных, но amount отрицательный, то добавим op_type
+            if not has_negative_service and amount < 0:
+                expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
         else:
-            expense = abs(amount)
-            expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
+            if amount < 0:
+                expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
 
     if transactions:
         write_log(f"🔍 Найдены operation_type: {', '.join(unique_types)}")
@@ -460,32 +488,28 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
 
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
 
-    for category, amount in sorted_items:
-        # Делаем короткое имя для читаемости, но НЕ объединяем разные категории
-        short_name = category
-        if category == "Доставка покупателю":
-            short_name = "Доставка покупателю"
-        elif category == "Доставка и обработка возврата, отмены, невыкупа":
-            short_name = "Доставка/возвраты"
-        elif category == "Оплата эквайринга":
-            short_name = "Эквайринг"
-        elif category == "Кросс-докинг":
-            short_name = "Кросс-докинг"
-        elif category == "Страхование товара от массовых повреждений":
-            short_name = "Страхование"
-        elif category == "Обеспечение материалами для упаковки товара":
-            short_name = "Обеспечение упаковкой"
-        elif category == "Упаковка товара партнёрами":
-            short_name = "Упаковка"
-        elif category == "Подписка Управление отзывами":
-            short_name = "Подписка"
-        elif category == "Оплата за клик":
-            short_name = "Оплата за клик"
-        elif category == "Получение возврата, отмены, невыкупа от покупателя":
-            short_name = "Получение возвратов"
-        else:
-            short_name = category[:40]
+    # Сопоставление длинных названий с короткими
+    name_map = {
+        "Комиссия Ozon": "Комиссия",
+        "Оплата эквайринга": "Эквайринг",
+        "Доставка покупателю": "Доставка покупателю",
+        "Доставка и обработка возврата, отмены, невыкупа": "Доставка/возвраты",
+        "MarketplaceServiceItemDirectFlowLogistic": "Логистика (прямая)",
+        "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика (последняя миля)",
+        "MarketplaceServiceItemReturnFlowLogistic": "Логистика (возврат)",
+        "MarketplaceServiceItemDeliveryToHandoverPlaceOzon": "Доставка до ПВЗ",
+        "MarketplaceRedistributionOfAcquiringOperation": "Эквайринг",
+        "Кросс-докинг": "Кросс-докинг",
+        "Страхование товара от массовых повреждений": "Страхование",
+        "Обеспечение материалами для упаковки товара": "Обеспечение упаковкой",
+        "Упаковка товара партнёрами": "Упаковка",
+        "Подписка Управление отзывами": "Подписка",
+        "Оплата за клик": "Оплата за клик",
+        "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
+    }
 
+    for category, amount in sorted_items:
+        short_name = name_map.get(category, category[:40])
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
     if previous_expenses is not None:
