@@ -343,14 +343,8 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ (ИСПРАВЛЕННЫЕ) ----------
+# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
 def fetch_finance_transactions(date_from, date_to):
-    """
-    Получает все финансовые транзакции за указанный период.
-    date_from, date_to — строки в формате 'YYYY-MM-DD'
-    Возвращает список транзакций.
-    """
-    # Проверка на будущие даты
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
         write_log(f"⏭️ Пропуск запроса: date_from ({date_from}) > today ({today_str})")
@@ -365,7 +359,6 @@ def fetch_finance_transactions(date_from, date_to):
         "Content-Type": "application/json",
     }
 
-    # Формат даты: ISO с миллисекундами и часовым поясом UTC (Z)
     from_iso = date_from + "T00:00:00.000Z"
     to_iso = date_to + "T23:59:59.999Z"
 
@@ -395,18 +388,13 @@ def fetch_finance_transactions(date_from, date_to):
 
             response.raise_for_status()
             data = response.json()
-
-            # В ответе данные лежат в result.operations
             items = data.get("result", {}).get("operations", [])
             if not items:
                 break
 
             all_transactions.extend(items)
-
-            # Если получили меньше, чем запросили, значит это последняя страница
             if len(items) < page_size:
                 break
-
             page += 1
 
         except requests.exceptions.HTTPError as e:
@@ -421,13 +409,6 @@ def fetch_finance_transactions(date_from, date_to):
     return all_transactions
 
 def aggregate_finance_expenses(transactions):
-    """
-    Агрегирует расходы из транзакций.
-    Возвращает словарь {категория: сумма} для всех расходов (amount < 0).
-    Если есть услуги (services) с отрицательными суммами, использует их названия.
-    Если в services нет отрицательных сумм, использует operation_type_name.
-    Если services отсутствуют, использует operation_type_name.
-    """
     expense_by_type = {}
     unique_types = set()
     unique_services = set()
@@ -451,17 +432,13 @@ def aggregate_finance_expenses(transactions):
                     unique_services.add(service_name)
                     expense = abs(service_amount)
                     expense_by_type[service_name] = expense_by_type.get(service_name, 0) + expense
-            # Если в services не было отрицательных сумм, но сама транзакция расходная,
-            # то используем operation_type_name (сумма amount)
             if not has_negative_service:
                 expense = abs(amount)
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
         else:
-            # Нет services, используем operation_type_name
             expense = abs(amount)
             expense_by_type[op_type] = expense_by_type.get(op_type, 0) + expense
 
-    # Логируем найденные категории (если есть транзакции)
     if transactions:
         write_log(f"🔍 Найдены operation_type: {', '.join(unique_types)}")
         if unique_services:
@@ -470,23 +447,13 @@ def aggregate_finance_expenses(transactions):
     return expense_by_type
 
 def format_expense_block(expenses_by_type, title, previous_expenses=None):
-    """
-    Формирует строку с расходами по категориям.
-    Если переданы previous_expenses, показывает изменение в процентах.
-    """
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
 
-    total = sum(expenses_by_type.values())
-    lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
-
-    # Сортировка по убыванию суммы
-    sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
-
-    for category, amount in sorted_items:
-        # Попробуем сделать короткое имя для читаемости
+    # Группируем по сокращённым названиям
+    grouped = {}
+    for category, amount in expenses_by_type.items():
         short_name = category
-        # Сокращаем часто встречающиеся названия
         if "Комиссия" in category:
             short_name = "Комиссия"
         elif "Логистика" in category or "Доставка" in category:
@@ -511,10 +478,15 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
             short_name = "Страхование"
         else:
             short_name = category[:40]
+        grouped[short_name] = grouped.get(short_name, 0) + amount
 
+    total = sum(grouped.values())
+    lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
+
+    sorted_items = sorted(grouped.items(), key=lambda x: x[1], reverse=True)
+    for short_name, amount in sorted_items:
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
-    # Если есть предыдущий период, показываем динамику
     if previous_expenses is not None:
         prev_total = sum(previous_expenses.values()) if previous_expenses else 0
         if prev_total > 0:
@@ -622,7 +594,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # Финансовые расходы
     expenses_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
     expenses_yesterday = aggregate_finance_expenses(fetch_finance_transactions(yesterday_str, yesterday_str))
     expenses_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, current_month_end_str))
@@ -772,7 +743,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     parts.append(format_today_block())
     parts.append(format_month_block())
 
-    # Блоки расходов (финансовые) — теперь с детальной разбивкой
     parts.append(format_expense_block(expenses_today, "Расходы сегодня", expenses_yesterday))
     parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц (аналог. период)", expenses_prev_month))
 
@@ -822,7 +792,7 @@ def generate_sales_chart(years_list):
     plt.close(fig)
     return buf
 
-# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ (исправленные) ----------
+# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ ----------
 def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
@@ -856,7 +826,6 @@ def format_single_metrics(metrics, title):
         f"  ДРР (по доставленным): {eff_drr_text}"
     )
 
-    # Блок расходов (финансовые транзакции)
     expenses = metrics.get("expenses", {})
     if expenses:
         expense_block = format_expense_block(expenses, "Расходы за период", previous_expenses=None)
@@ -884,10 +853,8 @@ def get_metrics_for_date(date_str):
     else:
         metrics["effective_drr"] = None
 
-    # Финансовые расходы за дату
     expenses = aggregate_finance_expenses(fetch_finance_transactions(date_str, date_str))
     metrics["expenses"] = expenses
-
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
@@ -917,10 +884,8 @@ def get_metrics_for_period(date_from, date_to):
     else:
         total["effective_drr"] = None
 
-    # Финансовые расходы за период
     expenses = aggregate_finance_expenses(fetch_finance_transactions(date_from, date_to))
     total["expenses"] = expenses
-
     return total
 
 # ---------- КЛАВИАТУРЫ ----------
@@ -1239,7 +1204,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # ---------- Обработка выбора даты ----------
     if data.startswith("date_"):
         if data == "date_cancel":
             await query.edit_message_text("Выбор даты отменён.")
@@ -1275,7 +1239,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_DATE_SINGLE
 
-    # ---------- Обработка выбора периода ----------
     if data == "period_month":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
@@ -1448,7 +1411,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PERIOD_END
 
-    # ---------- Динамика продаж ----------
     if data == "dynamics_current":
         await query.edit_message_text("⏳ Загружаю данные для текущего года...")
         current_year = get_moscow_today().year
@@ -1491,7 +1453,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text("❌ Неизвестная команда.")
     return ConversationHandler.END
 
-# ---------- ОБРАБОТЧИКИ ДИАЛОГА ДЛЯ ДИНАМИКИ (диапазон) ----------
+# ---------- ДИАЛОГ ДЛЯ ДИНАМИКИ (диапазон) ----------
 async def dynamics_range_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text.isdigit():
@@ -1549,7 +1511,6 @@ def main():
                    .build())
 
     application.add_handler(CommandHandler("start", start))
-    # Команда /help
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         if is_admin(chat_id):
@@ -1659,7 +1620,6 @@ def main():
     application.add_handler(conv_remove)
     application.add_handler(CallbackQueryHandler(handle_callback_query))
 
-    # Планировщик
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_repeating(scheduled_report, interval=3600, first=0)
