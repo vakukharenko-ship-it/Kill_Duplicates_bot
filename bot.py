@@ -343,7 +343,7 @@ def fetch_advertising_expense(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ ----------
+# ---------- ФУНКЦИИ ДЛЯ ФИНАНСОВЫХ ТРАНЗАКЦИЙ (С РАСШИРЕННЫМ ЛОГИРОВАНИЕМ) ----------
 def fetch_finance_transactions(date_from, date_to):
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
@@ -365,6 +365,7 @@ def fetch_finance_transactions(date_from, date_to):
     all_transactions = []
     page = 1
     page_size = 1000
+    first_response_logged = False
 
     while True:
         payload = {
@@ -388,6 +389,11 @@ def fetch_finance_transactions(date_from, date_to):
 
             response.raise_for_status()
             data = response.json()
+
+            if not first_response_logged:
+                write_log(f"🔍 Первый ответ Finance API: {json.dumps(data, ensure_ascii=False)[:1500]}")
+                first_response_logged = True
+
             items = data.get("result", {}).get("operations", [])
             if not items:
                 break
@@ -415,18 +421,14 @@ def aggregate_finance_expenses(transactions):
     sample_count = 0
     for t in transactions:
         amount = t.get("amount", 0)
-        # Логируем примеры транзакций с services
-        if sample_count < 3:
-            services = t.get("services", [])
-            if services:
-                write_log(f"🔍 Пример транзакции: amount={amount}, operation_type={t.get('operation_type_name')}, services={json.dumps(services, ensure_ascii=False)}")
-                sample_count += 1
         if amount >= 0:
             continue
-
+        # Логируем первые 10 расходных транзакций полностью
+        if sample_count < 10:
+            write_log(f"🔍 Расход №{sample_count+1}: amount={amount}, operation_type={t.get('operation_type_name')}, services={json.dumps(t.get('services', []), ensure_ascii=False)}")
+            sample_count += 1
         op_type = t.get("operation_type_name", "Неизвестный тип")
         unique_types.add(op_type)
-
         services = t.get("services", [])
         if services and isinstance(services, list):
             has_negative_service = False
@@ -449,6 +451,8 @@ def aggregate_finance_expenses(transactions):
         write_log(f"🔍 Найдены operation_type: {', '.join(unique_types)}")
         if unique_services:
             write_log(f"🔍 Найдены услуги (services): {', '.join(unique_services)}")
+        if expense_by_type:
+            write_log(f"🔍 Итоговые категории расходов: {', '.join(expense_by_type.keys())}")
 
     return expense_by_type
 
@@ -482,6 +486,12 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
             short_name = "Обеспечение упаковкой"
         elif "Страхование" in category:
             short_name = "Страхование"
+        elif "Вознаграждение" in category:
+            short_name = "Вознаграждение Ozon"
+        elif "Потеря" in category:
+            short_name = "Потери"
+        elif "Утилизация" in category:
+            short_name = "Утилизация"
         else:
             short_name = category[:40]
         grouped[short_name] = grouped.get(short_name, 0) + amount
