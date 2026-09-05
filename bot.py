@@ -489,35 +489,28 @@ def aggregate_finance_expenses(transactions):
                 write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, accruals_for_sale={t.get('accruals_for_sale')}, services={json.dumps(services, ensure_ascii=False)}")
                 sample_count += 1
 
-        # 1. Комиссия (всегда расход)
         sale_comm = t.get("sale_commission", 0)
         if sale_comm < 0:
             expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
 
-        # 2. Начисления за продажу (выручка)
         accruals = t.get("accruals_for_sale", 0)
         if accruals > 0:
-            # Это выручка (доход)
             income_by_type["Выручка"] = income_by_type.get("Выручка", 0) + accruals
         elif accruals < 0:
-            # Возврат выручки (расход)
             expense_by_type["Возврат выручки"] = expense_by_type.get("Возврат выручки", 0) + abs(accruals)
 
-        # 3. Доставка
         delivery_charge = t.get("delivery_charge", 0)
         if delivery_charge < 0:
             expense_by_type["Доставка (отдельно)"] = expense_by_type.get("Доставка (отдельно)", 0) + abs(delivery_charge)
         elif delivery_charge > 0:
             income_by_type["Доставка (отдельно)"] = income_by_type.get("Доставка (отдельно)", 0) + delivery_charge
 
-        # 4. Возвратная доставка
         return_delivery = t.get("return_delivery_charge", 0)
         if return_delivery < 0:
             expense_by_type["Возвратная доставка"] = expense_by_type.get("Возвратная доставка", 0) + abs(return_delivery)
         elif return_delivery > 0:
             income_by_type["Возвратная доставка"] = income_by_type.get("Возвратная доставка", 0) + return_delivery
 
-        # 5. Основной amount и services
         amount = t.get("amount", 0)
         op_type = t.get("operation_type_name", "Неизвестный тип")
         if amount < 0:
@@ -541,7 +534,6 @@ def aggregate_finance_expenses(transactions):
                 elif service_amount > 0:
                     has_positive_service = True
                     income_by_type[service_name] = income_by_type.get(service_name, 0) + service_amount
-            # Если в services не было отрицательных, но amount отрицательный, то добавим op_type
             if not has_negative_service and amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
             if not has_positive_service and amount > 0:
@@ -572,7 +564,6 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
     lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
 
     name_map = {
-        # Основные группы из таблицы
         "Комиссия Ozon": "Комиссия",
         "Оплата эквайринга": "Эквайринг",
         "Доставка покупателю": "Доставка покупателю",
@@ -584,7 +575,6 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "Подписка Управление отзывами": "Подписка",
         "Оплата за клик": "Оплата за клик",
         "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
-        # Технические имена из services
         "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
         "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
         "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
@@ -602,7 +592,6 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "MarketplaceServiceItemTemporaryStorageRedistribution": "Временное размещение",
         "MarketplaceServiceProductMovementFromWarehouse": "Вывоз до ПВЗ",
         "MarketplaceServiceItemDisposalDetailed": "Утилизация",
-        # Услуги FBO и другие
         "Звёздные товары": "Звёздные товары",
         "Временное размещение товара партнерами": "Временное размещение",
         "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
@@ -642,14 +631,15 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
                 write_log(f"⚠️ Не найдено соответствие для категории: {category}")
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
-    if previous_expenses is not None:
-        prev_total = sum(previous_expenses.values()) if previous_expenses else 0
-        if prev_total > 0:
-            delta = ((total - prev_total) / prev_total) * 100
-            sign = "+" if delta > 0 else ""
-            lines.append(f"  *Изменение vs предыдущий:* {sign}{delta:.1f}%")
-        else:
-            lines.append("  *Изменение vs предыдущий:* ∞")
+    # Удаляем строку "Изменение vs предыдущий"
+    # if previous_expenses is not None:
+    #     prev_total = sum(previous_expenses.values()) if previous_expenses else 0
+    #     if prev_total > 0:
+    #         delta = ((total - prev_total) / prev_total) * 100
+    #         sign = "+" if delta > 0 else ""
+    #         lines.append(f"  *Изменение vs предыдущий:* {sign}{delta:.1f}%")
+    #     else:
+    #         lines.append("  *Изменение vs предыдущий:* ∞")
 
     return "\n".join(lines)
 
@@ -835,7 +825,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # Финансы: расходы и доходы
+    # Финансы: расходы и доходы (доходы пока не используем, но оставим для возможного расширения)
     expenses_today, incomes_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
     expenses_yesterday, incomes_yesterday = aggregate_finance_expenses(fetch_finance_transactions(yesterday_str, yesterday_str))
     expenses_month, incomes_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, current_month_end_str))
@@ -867,10 +857,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 
     d_ord_sum = calc_delta(today_metrics.get("ordered_sum", 0), yesterday_metrics.get("ordered_sum", 0))
     d_ord_units = calc_delta(today_metrics.get("ordered_units", 0), yesterday_metrics.get("ordered_units", 0))
-    d_del_sum = calc_delta(today_metrics.get("delivered_sum", 0), yesterday_metrics.get("delivered_sum", 0))
-    d_del_units = calc_delta(today_metrics.get("delivered_units", 0), yesterday_metrics.get("delivered_units", 0))
-    d_can_sum = calc_delta(today_metrics.get("canceled_sum", 0), yesterday_metrics.get("canceled_sum", 0))
-    d_can_units = calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0))
+    # убираем доставку и рекламу из сегодня
     d_ad = calc_delta(ad_today, ad_yesterday)
 
     d_ord_sum_m = calc_delta(month_metrics.get("ordered_sum", 0), prev_month_metrics.get("ordered_sum", 0))
@@ -881,65 +868,25 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
     d_ad_m = calc_delta(ad_month, ad_prev_month)
 
-    def format_yesterday_block():
-        ordered_sum = fmt_num(yesterday_full_metrics.get("ordered_sum", 0))
-        ordered_units = fmt_int(yesterday_full_metrics.get("ordered_units", 0))
-        delivered_sum = fmt_num(yesterday_full_metrics.get("delivered_sum", 0))
-        delivered_units = fmt_int(yesterday_full_metrics.get("delivered_units", 0))
-        canceled_sum = fmt_num(yesterday_full_metrics.get("canceled_sum", 0))
-        canceled_units = fmt_int(yesterday_full_metrics.get("canceled_units", 0))
-        ad_expense = fmt_num(ad_yesterday)
-
-        revenue = yesterday_full_metrics.get("ordered_sum", 0)
-        drr = (ad_yesterday / revenue * 100) if revenue > 0 else None
-        delivered_revenue = yesterday_full_metrics.get("delivered_sum", 0)
-        eff_drr = (ad_yesterday / delivered_revenue * 100) if delivered_revenue > 0 else None
-        drr_str = f"{drr:.2f}%" if drr is not None else "∞"
-        eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
-
-        return (
-            f"🔹 *Вчера*\n"
-            f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n\n"
-            f"  📦 Доставлено: \n  {delivered_sum} ₽ / {delivered_units} шт.\n\n"
-            f"  ❌ Отмены: \n  {canceled_sum} ₽ / {canceled_units} шт.\n\n"
-            f"  📢 Реклама: \n  {ad_expense} ₽\n  ДРР общ: {drr_str}\n  ДРР дост: {eff_drr_str}"
-        )
+    # Удаляем блок "Вчера" полностью – не используем format_yesterday_block
 
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
-        delivered_sum = fmt_num(today_metrics.get("delivered_sum", 0))
-        delivered_units = fmt_int(today_metrics.get("delivered_units", 0))
         canceled_sum = fmt_num(today_metrics.get("canceled_sum", 0))
         canceled_units = fmt_int(today_metrics.get("canceled_units", 0))
-        ad_expense = fmt_num(ad_today)
-
-        revenue = today_metrics.get("ordered_sum", 0)
-        drr = (ad_today / revenue * 100) if revenue > 0 else None
-        delivered_revenue = today_metrics.get("delivered_sum", 0)
-        eff_drr = (ad_today / delivered_revenue * 100) if delivered_revenue > 0 else None
-        drr_str = f"{drr:.2f}%" if drr is not None else "∞"
-        eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
         delta_ord_sum = fmt_pct(d_ord_sum)
         delta_ord_units = fmt_pct(d_ord_units)
-        delta_del_sum = fmt_pct(d_del_sum)
-        delta_del_units = fmt_pct(d_del_units)
-        delta_can_sum = fmt_pct(d_can_sum)
-        delta_can_units = fmt_pct(d_can_units)
-        delta_ad = fmt_pct(d_ad)
+        delta_can_sum = fmt_pct(calc_delta(today_metrics.get("canceled_sum", 0), yesterday_metrics.get("canceled_sum", 0)))
+        delta_can_units = fmt_pct(calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0)))
 
         return (
             f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
             f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n"
             f"    vs Вчера: \n  {delta_ord_sum} ₽ / {delta_ord_units} шт.\n\n"
-            f"  📦 Доставлено: \n  {delivered_sum} ₽ / {delivered_units} шт.\n"
-            f"    vs Вчера: \n  {delta_del_sum} ₽ / {delta_del_units} шт.\n\n"
             f"  ❌ Отмены: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
-            f"    vs Вчера: \n  {delta_can_sum} ₽ / {delta_can_units} шт.\n\n"
-            f"  📢 Реклама: \n  {ad_expense} ₽ | vs Вчера: {delta_ad}\n"
-            f"  ДРР общ: {drr_str} | vs Вчера: {delta_ad}\n"
-            f"  ДРР дост: {eff_drr_str} | vs Вчера: {delta_ad}"
+            f"    vs Вчера: \n  {delta_can_sum} ₽ / {delta_can_units} шт."
         )
 
     def format_month_block():
@@ -967,7 +914,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         delta_ad_m = fmt_pct(d_ad_m)
 
         return (
-            f"🔹 *Текущий месяц (за аналогичный период)*\n"
+            f"🔹 *Текущий месяц*\n"
             f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n"
             f"    vs предыдущий месяц: \n  {delta_ord_sum_m} ₽ / {delta_ord_units_m} шт.\n\n"
             f"  📦 Доставлено: \n  {delivered_sum} ₽ / {delivered_units} шт.\n"
@@ -975,22 +922,23 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  ❌ Отмены: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
             f"    vs предыдущий месяц: \n  {delta_can_sum_m} ₽ / {delta_can_units_m} шт.\n\n"
             f"  📢 Реклама: \n  {ad_expense} ₽ | vs предыдущий месяц: {delta_ad_m}\n"
-            f"  ДРР общ: {drr_str} | vs предыдущий месяц: {delta_ad_m}\n"
-            f"  ДРР дост: {eff_drr_str} | vs предыдущий месяц: {delta_ad_m}"
+            f"  ДРР общ: {drr_str} | vs предыдущий месяц: {delta_ad_m}"
         )
 
     parts = []
-    if include_yesterday:
-        parts.append(format_yesterday_block())
+    # Убираем вчера
     parts.append(format_today_block())
     parts.append(format_month_block())
 
-    parts.append(format_expense_block(expenses_today, "Расходы сегодня", expenses_yesterday))
-    parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц (аналог. период)", expenses_prev_month))
-    parts.append(format_income_block(incomes_today, "Доходы сегодня", incomes_yesterday))
-    parts.append(format_income_block(incomes_month, "Доходы за текущий месяц (аналог. период)", incomes_prev_month))
+    # Блоки расходов (без динамики)
+    parts.append(format_expense_block(expenses_today, "Расходы сегодня", None))
+    parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц", None))
 
-    return "📊 *Текущие показатели*\n\n\n" + "\n\n".join(parts)
+    # Удаляем блоки доходов
+    # parts.append(format_income_block(incomes_today, "Доходы сегодня", incomes_yesterday))
+    # parts.append(format_income_block(incomes_month, "Доходы за текущий месяц", incomes_prev_month))
+
+    return "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
 
 # ---------- Функции для динамики продаж (график) ----------
 def get_monthly_delivered_sum(year):
@@ -1157,7 +1105,7 @@ def main_user_keyboard():
 
 def reports_keyboard():
     buttons = [
-        [KeyboardButton("📅 Текущие показатели")],
+        [KeyboardButton("📅 Продажи за сегодня")],
         [KeyboardButton("📆 Выбрать дату")],
         [KeyboardButton("📊 Выбрать период")],
         [KeyboardButton("📈 Динамика продаж")],
@@ -1213,7 +1161,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📖 *Справка для администратора*\n\n"
                 "🔹 *Основные функции*\n"
                 "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
-                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📅 Продажи за сегодня – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
                 "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
                 "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
@@ -1243,7 +1191,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📖 *Справка для менеджера*\n\n"
                 "🔹 *Основные функции*\n"
                 "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
-                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📅 Продажи за сегодня – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
                 "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
                 "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n\n"
@@ -1283,7 +1231,7 @@ async def handle_reports_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
         return
 
-    if text == "📅 Текущие показатели":
+    if text == "📅 Продажи за сегодня":
         report = format_combined_metrics_with_deltas(include_yesterday=False)
         await update.message.reply_text(report, parse_mode="Markdown")
     elif text == "📆 Выбрать дату":
@@ -1771,7 +1719,7 @@ def main():
                 "📖 *Справка для администратора*\n\n"
                 "🔹 *Основные функции*\n"
                 "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
-                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📅 Продажи за сегодня – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
                 "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
                 "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
@@ -1801,7 +1749,7 @@ def main():
                 "📖 *Справка для менеджера*\n\n"
                 "🔹 *Основные функции*\n"
                 "• 📊 Отчёт – получить актуальную сводку за сегодня, вчера и текущий месяц.\n"
-                "• 📅 Текущие показатели – быстрый доступ к сводке.\n"
+                "• 📅 Продажи за сегодня – быстрый доступ к сводке.\n"
                 "• 📆 Выбрать дату – просмотр данных за конкретный день.\n"
                 "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
                 "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n\n"
@@ -1825,7 +1773,7 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
 
     application.add_handler(MessageHandler(filters.Text(["📊 Отчёт", "⚙️ Администрирование", "📖 Справка"]), handle_main_menu))
-    application.add_handler(MessageHandler(filters.Text(["📅 Текущие показатели", "📆 Выбрать дату", "📊 Выбрать период", "📈 Динамика продаж", "🔙 Назад"]), handle_reports_menu))
+    application.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня", "📆 Выбрать дату", "📊 Выбрать период", "📈 Динамика продаж", "🔙 Назад"]), handle_reports_menu))
     application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
 
     conv_date = ConversationHandler(
