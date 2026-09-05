@@ -470,10 +470,12 @@ def fetch_finance_transactions(date_from, date_to):
     write_log(f"💰 Всего загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
     return all_transactions
 
-# ---------- АГРЕГАЦИЯ ФИНАНСОВЫХ ДАННЫХ (расходы и доходы) ----------
+# ---------- АГРЕГАЦИЯ ФИНАНСОВЫХ РАСХОДОВ (без доходов) ----------
 def aggregate_finance_expenses(transactions):
+    """
+    Возвращает словарь {категория: сумма_расхода} для всех отрицательных значений.
+    """
     expense_by_type = {}
-    income_by_type = {}
     unique_types = set()
     unique_services = set()
     sample_count = 0
@@ -489,34 +491,25 @@ def aggregate_finance_expenses(transactions):
             expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
 
         accruals = t.get("accruals_for_sale", 0)
-        if accruals > 0:
-            income_by_type["Выручка"] = income_by_type.get("Выручка", 0) + accruals
-        elif accruals < 0:
+        if accruals < 0:
             expense_by_type["Возврат выручки"] = expense_by_type.get("Возврат выручки", 0) + abs(accruals)
 
         delivery_charge = t.get("delivery_charge", 0)
         if delivery_charge < 0:
             expense_by_type["Доставка (отдельно)"] = expense_by_type.get("Доставка (отдельно)", 0) + abs(delivery_charge)
-        elif delivery_charge > 0:
-            income_by_type["Доставка (отдельно)"] = income_by_type.get("Доставка (отдельно)", 0) + delivery_charge
 
         return_delivery = t.get("return_delivery_charge", 0)
         if return_delivery < 0:
             expense_by_type["Возвратная доставка"] = expense_by_type.get("Возвратная доставка", 0) + abs(return_delivery)
-        elif return_delivery > 0:
-            income_by_type["Возвратная доставка"] = income_by_type.get("Возвратная доставка", 0) + return_delivery
 
         amount = t.get("amount", 0)
         op_type = t.get("operation_type_name", "Неизвестный тип")
         if amount < 0:
             unique_types.add(op_type)
-        elif amount > 0:
-            unique_types.add(op_type + " (доход)")
 
         services = t.get("services", [])
         if services and isinstance(services, list):
             has_negative_service = False
-            has_positive_service = False
             for service in services:
                 service_name = service.get("name", "Неизвестная услуга")
                 service_amount = service.get("price", 0)
@@ -526,18 +519,11 @@ def aggregate_finance_expenses(transactions):
                     has_negative_service = True
                     unique_services.add(service_name)
                     expense_by_type[service_name] = expense_by_type.get(service_name, 0) + abs(service_amount)
-                elif service_amount > 0:
-                    has_positive_service = True
-                    income_by_type[service_name] = income_by_type.get(service_name, 0) + service_amount
             if not has_negative_service and amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
-            if not has_positive_service and amount > 0:
-                income_by_type[op_type] = income_by_type.get(op_type, 0) + amount
         else:
             if amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
-            elif amount > 0:
-                income_by_type[op_type] = income_by_type.get(op_type, 0) + amount
 
     if transactions:
         write_log(f"🔍 Найдены operation_type: {', '.join(unique_types)}")
@@ -545,13 +531,11 @@ def aggregate_finance_expenses(transactions):
             write_log(f"🔍 Найдены услуги (services): {', '.join(unique_services)}")
         if expense_by_type:
             write_log(f"🔍 Итоговые категории расходов: {', '.join(expense_by_type.keys())}")
-        if income_by_type:
-            write_log(f"🔍 Итоговые категории доходов: {', '.join(income_by_type.keys())}")
 
-    return expense_by_type, income_by_type
+    return expense_by_type
 
 # ---------- ФОРМАТИРОВАНИЕ БЛОКОВ ----------
-def format_expense_block(expenses_by_type, title, previous_expenses=None):
+def format_expense_block(expenses_by_type, title):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
 
@@ -626,92 +610,6 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
                 short_name = category[:40]
                 write_log(f"⚠️ Не найдено соответствие для категории: {category}")
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
-
-    return "\n".join(lines)
-
-def format_income_block(income_by_type, title, previous_incomes=None):
-    if not income_by_type:
-        return f"🔹 *{title}*\nНет данных о доходах.\n"
-
-    total = sum(income_by_type.values())
-    lines = [f"🔹 *{title}*", f"  *Итого доходов:* {total:,.2f} ₽"]
-
-    name_map = {
-        "Комиссия Ozon": "Комиссия",
-        "Оплата эквайринга": "Эквайринг",
-        "Доставка покупателю": "Доставка покупателю",
-        "Доставка и обработка возврата, отмены, невыкупа": "Доставка/возвраты",
-        "Кросс-докинг": "Кросс-докинг",
-        "Страхование товара от массовых повреждений": "Страхование",
-        "Обеспечение материалами для упаковки товара": "Обеспечение упаковкой",
-        "Упаковка товара партнёрами": "Упаковка",
-        "Подписка Управление отзывами": "Подписка",
-        "Оплата за клик": "Оплата за клик",
-        "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
-        "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
-        "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
-        "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
-        "MarketplaceServiceItemDeliveryToHandoverPlaceOzon": "Доставка до ПВЗ",
-        "MarketplaceRedistributionOfAcquiringOperation": "Эквайринг",
-        "MarketplaceServiceItemRedistributionReturnsPVZ": "Обработка возвратов (ПВЗ)",
-        "MarketplaceServiceItemPackageRedistribution": "Переупаковка",
-        "MarketplaceServiceItemPackageMaterialsProvision": "Обеспечение упаковкой",
-        "MarketplaceServiceItemProductReviewsManagementSubscription": "Подписка",
-        "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля (ПВЗ)",
-        "MarketplaceServiceItemDirectFlowLogisticFBS": "Логистика прямая (FBS)",
-        "MarketplaceServiceItemReturnFlowLogisticFBS": "Логистика возврат (FBS)",
-        "ItemAgentServiceStarsMembership": "Звёздные товары",
-        "MarketplaceServiceSellerReturnsCargoAssortment": "Обработка возвратов партнёрами",
-        "MarketplaceServiceItemTemporaryStorageRedistribution": "Временное размещение",
-        "MarketplaceServiceProductMovementFromWarehouse": "Вывоз до ПВЗ",
-        "MarketplaceServiceItemDisposalDetailed": "Утилизация",
-        "Звёздные товары": "Звёздные товары",
-        "Временное размещение товара партнерами": "Временное размещение",
-        "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
-        "Обработка товара в составе грузоместа на FBO": "Поштучная приёмка",
-        "Подготовка товара к вывозу: Брак": "Подготовка к вывозу (брак)",
-        "Вывоз товара со склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
-        "Вывоз товара со Склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
-        "Бронирование места и персонала для поставки с неполным составом в составе грузоместа": "Бронирование места",
-        "Услуга по бронированию места и персонала для поставки с неполным составом в составе ГМ": "Бронирование места",
-        "Обработка опознанных излишков в составе грузоместа": "Обработка излишков",
-        "Услуга по обработке опознанных излишков в составе ГМ": "Обработка излишков",
-        "Утилизация товара: Пролились/просыпались из-за упаковки": "Утилизация",
-        "Потеря по вине Ozon на складе": "Потеря (склад)",
-        "Потеря по вине Ozon в логистике": "Потеря (логистика)",
-        "Вознаграждение за продажу": "Вознаграждение",
-        "Возврат вознаграждения": "Возврат вознаграждения",
-        "Программы партнёров": "Программы партнёров",
-        "Баллы за скидки": "Баллы за скидки",
-        "Выручка": "Выручка",
-        "Возврат выручки": "Возврат выручки",
-    }
-
-    sorted_items = sorted(income_by_type.items(), key=lambda x: x[1], reverse=True)
-
-    for category, amount in sorted_items:
-        if category in name_map:
-            short_name = name_map[category]
-        else:
-            found = False
-            for key, value in name_map.items():
-                if key in category or category in key:
-                    short_name = value
-                    found = True
-                    break
-            if not found:
-                short_name = category[:40]
-                write_log(f"⚠️ Не найдено соответствие для категории дохода: {category}")
-        lines.append(f"    {short_name}: {amount:,.2f} ₽")
-
-    if previous_incomes is not None:
-        prev_total = sum(previous_incomes.values()) if previous_incomes else 0
-        if prev_total > 0:
-            delta = ((total - prev_total) / prev_total) * 100
-            sign = "+" if delta > 0 else ""
-            lines.append(f"  *Изменение vs предыдущий:* {sign}{delta:.1f}%")
-        else:
-            lines.append("  *Изменение vs предыдущий:* ∞")
 
     return "\n".join(lines)
 
@@ -808,19 +706,22 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 
     ad_today = fetch_advertising_expense(today_str, today_str)
     ad_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
-    ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
-    ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    expenses_today, incomes_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
-    expenses_yesterday, incomes_yesterday = aggregate_finance_expenses(fetch_finance_transactions(yesterday_str, yesterday_str))
-    expenses_month, incomes_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, current_month_end_str))
-    expenses_prev_month, incomes_prev_month = aggregate_finance_expenses(fetch_finance_transactions(previous_month_start_str, previous_month_end_str))
+    # Для текущего месяца берём с 1-го по сегодня (с учётом времени для отгрузок, но для рекламы время не важно)
+    ad_month = fetch_advertising_expense(current_month_start_str, today_str)
 
-    # Добавляем рекламу в расходы за месяц
-    if ad_month > 0:
-        expenses_month["Реклама"] = ad_month
+    # Для предыдущего месяца берём аналогичный период (с 1-го по prev_period_end)
+    ad_prev_period = fetch_advertising_expense(previous_month_start_str, prev_period_end_str)
+
+    # Финансовые расходы (без доходов)
+    expenses_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
+    expenses_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, today_str))
+
+    # Добавляем рекламу в расходы
     if ad_today > 0:
         expenses_today["Реклама"] = ad_today
+    if ad_month > 0:
+        expenses_month["Реклама"] = ad_month
 
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
@@ -856,12 +757,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     d_del_units_m = calc_delta(month_metrics.get("delivered_units", 0), prev_month_metrics.get("delivered_units", 0))
     d_can_sum_m = calc_delta(month_metrics.get("canceled_sum", 0), prev_month_metrics.get("canceled_sum", 0))
     d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
-    d_ad_m = calc_delta(ad_month, ad_prev_month)
-
-    prev_revenue = prev_month_metrics.get("ordered_sum", 0)
-    prev_delivered_revenue = prev_month_metrics.get("delivered_sum", 0)
-    prev_drr = (ad_prev_month / prev_revenue * 100) if prev_revenue > 0 else None
-    prev_eff_drr = (ad_prev_month / prev_delivered_revenue * 100) if prev_delivered_revenue > 0 else None
+    d_ad_m = calc_delta(ad_month, ad_prev_period)
 
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
@@ -890,7 +786,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         canceled_sum = fmt_num(month_metrics.get("canceled_sum", 0))
         canceled_units = fmt_int(month_metrics.get("canceled_units", 0))
         ad_expense = fmt_num(ad_month)
-        ad_prev = fmt_num(ad_prev_month)
+        ad_prev = fmt_num(ad_prev_period)
 
         revenue = month_metrics.get("ordered_sum", 0)
         drr = (ad_month / revenue * 100) if revenue > 0 else None
@@ -899,8 +795,8 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 
         prev_rev = prev_month_metrics.get("ordered_sum", 0)
         prev_del_rev = prev_month_metrics.get("delivered_sum", 0)
-        prev_drr_val = (ad_prev_month / prev_rev * 100) if prev_rev > 0 else None
-        prev_eff_drr_val = (ad_prev_month / prev_del_rev * 100) if prev_del_rev > 0 else None
+        prev_drr_val = (ad_prev_period / prev_rev * 100) if prev_rev > 0 else None
+        prev_eff_drr_val = (ad_prev_period / prev_del_rev * 100) if prev_del_rev > 0 else None
 
         drr_str = f"{drr:.2f}%" if drr is not None else "∞"
         eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
@@ -931,8 +827,8 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     parts.append(format_today_block())
     parts.append(format_month_block())
 
-    parts.append(format_expense_block(expenses_today, "Расходы сегодня", None))
-    parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц", None))
+    parts.append(format_expense_block(expenses_today, "Расходы сегодня"))
+    parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц"))
 
     return "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
 
@@ -986,7 +882,7 @@ def format_single_metrics(metrics, title):
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     has_data = False
     for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense", "expenses", "incomes"]:
+        if key in ["drr", "effective_drr", "ad_expense", "expenses"]:
             continue
         if isinstance(val, (int, float)) and val != 0:
             has_data = True
@@ -1016,13 +912,8 @@ def format_single_metrics(metrics, title):
 
     expenses = metrics.get("expenses", {})
     if expenses:
-        expense_block = format_expense_block(expenses, "Расходы за период", previous_expenses=None)
+        expense_block = format_expense_block(expenses, "Расходы за период")
         main_text += "\n\n" + expense_block
-
-    incomes = metrics.get("incomes", {})
-    if incomes:
-        income_block = format_income_block(incomes, "Доходы за период", previous_incomes=None)
-        main_text += "\n\n" + income_block
 
     return main_text
 
@@ -1046,9 +937,8 @@ def get_metrics_for_date(date_str):
     else:
         metrics["effective_drr"] = None
 
-    expenses, incomes = aggregate_finance_expenses(fetch_finance_transactions(date_str, date_str))
+    expenses = aggregate_finance_expenses(fetch_finance_transactions(date_str, date_str))
     metrics["expenses"] = expenses
-    metrics["incomes"] = incomes
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
@@ -1078,9 +968,8 @@ def get_metrics_for_period(date_from, date_to):
     else:
         total["effective_drr"] = None
 
-    expenses, incomes = aggregate_finance_expenses(fetch_finance_transactions(date_from, date_to))
+    expenses = aggregate_finance_expenses(fetch_finance_transactions(date_from, date_to))
     total["expenses"] = expenses
-    total["incomes"] = incomes
     return total
 
 # ---------- КЛАВИАТУРЫ ----------
@@ -1174,8 +1063,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n"
-                "• 💵 Доходы (финансовые) – выручка, программы партнёров, баллы за скидки и другие поступления.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
@@ -1199,8 +1087,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n"
-                "• 💵 Доходы (финансовые) – выручка, программы партнёров, баллы за скидки и другие поступления.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
@@ -1732,8 +1619,7 @@ def main():
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n"
-                "• 💵 Доходы (финансовые) – выручка, программы партнёров, баллы за скидки и другие поступления.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
@@ -1757,8 +1643,7 @@ def main():
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отмены – сумма и количество отменённых заказов.\n"
                 "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n"
-                "• 💵 Доходы (финансовые) – выручка, программы партнёров, баллы за скидки и другие поступления.\n\n"
+                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца.\n\n"
