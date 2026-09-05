@@ -6,6 +6,8 @@ import re
 import calendar
 import requests
 import warnings
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ContextTypes, MessageHandler,
@@ -13,9 +15,6 @@ from telegram.ext import (
 )
 from telegram.warnings import PTBUserWarning
 from telegram.helpers import escape_markdown
-
-# Для параллельных запросов
-from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
@@ -92,10 +91,20 @@ WAITING_PRODUCT_PERIOD_CHOICE = 32
 WAITING_PRODUCT_SINGLE_YEAR = 33
 WAITING_PRODUCT_RANGE_START = 34
 WAITING_PRODUCT_RANGE_END = 35
-WAITING_PRODUCT_SKU_MANUAL = 36  # ручной ввод SKU
+WAITING_PRODUCT_SKU_MANUAL = 36
+# Состояния для /топ_товары
+WAITING_TOP_PERIOD_TYPE = 40
+WAITING_TOP_YEAR = 41
+WAITING_TOP_MONTH = 42
+WAITING_TOP_QUARTER = 43
+WAITING_TOP_RANGE_START = 44
+WAITING_TOP_RANGE_END = 45
 # =====================================================
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
+
+# Executor для параллельных задач
+executor = ThreadPoolExecutor(max_workers=3)
 
 def write_log(message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -214,38 +223,49 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- Валидация дат (Шаг 8) ----------
+# ==================== ВАЛИДАЦИЯ ДАННЫХ ====================
 def validate_date(date_str):
     """Проверка корректности даты"""
     try:
-        date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-        today = get_moscow_today()
-        if date > today:
+        date = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        
+        # Проверяем, что дата не в будущем
+        if date.date() > datetime.datetime.now().date():
             return False, "❌ Дата не может быть в будущем"
-        two_years_ago = today - datetime.timedelta(days=730)
+        
+        # Проверяем, что дата не слишком старая (например, > 2 лет)
+        two_years_ago = datetime.datetime.now() - datetime.timedelta(days=730)
         if date < two_years_ago:
             return False, "❌ Дата слишком старая (более 2 лет назад)"
-        return True, date
+        
+        return True, date.date()
     except ValueError:
-        return False, "❌ Неверный формат даты. Используйте YYYY-MM-DD"
+        return False, "❌ Неверный формат даты. Используйте YYYY-MM-DD (например, 2024-01-15)"
 
 def validate_period(date_from, date_to):
     """Проверка корректности периода"""
-    valid_from, from_date = validate_date(date_from)
+    valid_from, result_from = validate_date(date_from)
     if not valid_from:
-        return False, from_date
-    valid_to, to_date = validate_date(date_to)
+        return False, result_from
+    
+    valid_to, result_to = validate_date(date_to)
     if not valid_to:
-        return False, to_date
-    if from_date > to_date:
+        return False, result_to
+    
+    # Проверяем, что date_from <= date_to
+    if result_from > result_to:
         return False, "❌ Начальная дата не может быть позже конечной"
-    delta = (to_date - from_date).days
+    
+    # Проверяем, что период не слишком большой
+    delta = (result_to - result_from).days
     if delta > 365:
         return False, "❌ Период не может быть больше года"
-    return True, (from_date, to_date)
+    
+    return True, (result_from, result_to)
 
-# ---------- Функции API с retry и кэшированием ----------
+# ==================== API С RETRY И КЭШИРОВАНИЕМ ====================
 def api_request_with_retry(url, headers, payload=None, method='POST', timeout=API_TIMEOUT):
+    """Универсальная функция для API запросов с retry логикой"""
     for attempt in range(API_RETRY_ATTEMPTS):
         try:
             if method == 'POST':
@@ -268,81 +288,68 @@ def api_request_with_retry(url, headers, payload=None, method='POST', timeout=AP
             write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
             time.sleep(API_RETRY_DELAY)
 
-# ---------- Функции для получения данных Ozon (отгрузки) ----------
 def fetch_postings(date_from, date_to):
-    cache_key = f"fetch_postings_{date_from}_{date_to}"
+    """Получение отправлений с кэшированием"""
+    cache_key = f"postings_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
     if cached is not None:
+        write_log(f"📦 Используем кэш для postings {date_from}–{date_to}")
         return cached
-
+    
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "date_from": date_from,
-        "date_to": date_to,
-        "status": "",
-        "limit": 1000,
-        "offset": 0,
+        "Content-Type": "application/json"
     }
     all_postings = []
+    offset = 0
+    limit = 1000
+    
     while True:
+        payload = {
+            "dir": "ASC",
+            "filter": {
+                "since": f"{date_from}T00:00:00.000Z",
+                "to": f"{date_to}T23:59:59.999Z",
+                "status": ""
+            },
+            "limit": limit,
+            "offset": offset,
+            "with": {
+                "analytics_data": True,
+                "financial_data": True
+            }
+        }
         try:
-            response = api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload, method='POST')
+            response = api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload)
             data = response.json()
-            postings = data.get("result", [])
-            if not postings:
-                break
+            postings = data.get("result", {}).get("postings", [])
             all_postings.extend(postings)
-            if len(postings) < payload["limit"]:
+            if len(postings) < limit:
                 break
-            payload["offset"] += payload["limit"]
+            offset += limit
         except Exception as e:
-            write_log(f"❌ Ошибка получения отгрузок: {e}")
+            write_log(f"❌ Ошибка загрузки отправлений: {e}")
             break
-    write_log(f"📦 Загружено отгрузок: {len(all_postings)} за {date_from}–{date_to}")
+    
+    write_log(f"📦 Загружено {len(all_postings)} отправлений за {date_from}–{date_to}")
     save_to_cache(cache_key, all_postings)
     return all_postings
 
-def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
-    aggregated = {}
-    for posting in postings:
-        created_at = posting.get("created_at", "")
-        if not created_at:
-            continue
-        try:
-            dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            dt_msk = dt.astimezone(MOSCOW_TZ)
-        except:
-            continue
-        date_str = dt_msk.date().isoformat()
-        if date_from and date_str < date_from:
-            continue
-        if date_to and date_str > date_to:
-            continue
-
-        if time_limit is not None and apply_limit_on_day is not None and date_str == apply_limit_on_day:
-            if dt_msk.time() > time_limit:
-                continue
-
-        products = posting.get("products", [])
-        total_units = 0
-        total_sum = 0.0
-        for product in products:
-            qty = int(product.get("quantity", 0))
-            price_str = product.get("price", "0")
-            try:
-                price = float(price_str)
-            except:
-                price = 0.0
-            total_units += qty
-            total_sum += price * qty
-
-        status = posting.get("status", "")
-        if date_str not in aggregated:
-            aggregated[date_str] = {
+def aggregate_postings(postings, date_from=None, date_to=None):
+    """Агрегация отправлений по статусам"""
+    aggregation = {}
+    for p in postings:
+        status = p.get("status", "unknown")
+        products = p.get("products", [])
+        total = 0.0
+        for prod in products:
+            price = float(prod.get("price", "0"))
+            quantity = int(prod.get("quantity", 0))
+            total += price * quantity
+        
+        if status not in aggregation:
+            aggregation[status] = {
                 "ordered_units": 0,
                 "ordered_sum": 0.0,
                 "delivered_units": 0,
@@ -350,203 +357,162 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
                 "canceled_units": 0,
                 "canceled_sum": 0.0,
             }
+        
+        units_count = sum(int(prod.get("quantity", 0)) for prod in products)
+        
+        if status in ["awaiting_packaging", "awaiting_deliver", "arbitration", "client_arbitration"]:
+            aggregation[status]["ordered_units"] += units_count
+            aggregation[status]["ordered_sum"] += total
+        elif status == "delivered":
+            aggregation[status]["ordered_units"] += units_count
+            aggregation[status]["ordered_sum"] += total
+            aggregation[status]["delivered_units"] += units_count
+            aggregation[status]["delivered_sum"] += total
+        elif status in ["cancelled", "not_accepted"]:
+            aggregation[status]["canceled_units"] += units_count
+            aggregation[status]["canceled_sum"] += total
+        else:
+            aggregation[status]["ordered_units"] += units_count
+            aggregation[status]["ordered_sum"] += total
+    
+    return aggregation
 
-        aggregated[date_str]["ordered_units"] += total_units
-        aggregated[date_str]["ordered_sum"] += total_sum
-
-        if status in ("cancelled", "canceled"):
-            aggregated[date_str]["canceled_units"] += total_units
-            aggregated[date_str]["canceled_sum"] += total_sum
-        elif status in ("delivered", "completed"):
-            aggregated[date_str]["delivered_units"] += total_units
-            aggregated[date_str]["delivered_sum"] += total_sum
-
-    return aggregated
-
-# ---------- Функции для получения рекламных расходов (Performance) с разбивкой по месяцам ----------
 def get_performance_token():
-    if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
-        write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
-        return None
-
-    url = "https://api-performance.ozon.ru/api/client/token"
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+    """Получение токена Performance API"""
+    url = "https://performance.ozon.ru/api/client/token"
+    headers = {"Content-Type": "application/json"}
     payload = {
         "client_id": OZON_PERFORMANCE_CLIENT_ID,
         "client_secret": OZON_PERFORMANCE_CLIENT_SECRET,
         "grant_type": "client_credentials"
     }
     try:
-        response = api_request_with_retry(url, headers, payload, method='POST')
-        token_data = response.json()
-        token = token_data.get("access_token")
-        if token:
-            write_log("✅ Токен Performance API успешно получен.")
-            return token
-        else:
-            write_log(f"❌ Ошибка получения токена: {token_data}")
-            return None
+        response = api_request_with_retry(url, headers, payload)
+        data = response.json()
+        return data.get("access_token")
     except Exception as e:
-        write_log(f"❌ Ошибка при запросе токена: {e}")
+        write_log(f"❌ Ошибка получения токена Performance: {e}")
         return None
 
 def fetch_advertising_expense_single(date_from, date_to):
-    cache_key = f"fetch_advertising_expense_single_{date_from}_{date_to}"
-    cached = get_from_cache(cache_key)
-    if cached is not None:
-        return cached
-
+    """Получение расходов на рекламу за период"""
     token = get_performance_token()
     if not token:
         return 0.0
-
-    url = "https://api-performance.ozon.ru/api/client/statistics/expense/json"
+    
+    url = "https://performance.ozon.ru/api/client/statistics"
     headers = {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
     params = {
         "dateFrom": date_from,
         "dateTo": date_to,
+        "groupBy": "NO_GROUP_BY"
     }
     try:
         response = api_request_with_retry(url, headers, params, method='GET')
         data = response.json()
-        total_expense = 0.0
-        if isinstance(data, dict) and "rows" in data:
-            rows = data["rows"]
-            if isinstance(rows, list):
-                for item in rows:
-                    item_date = item.get("date")
-                    if item_date and len(item_date) >= 10:
-                        item_date_str = item_date[:10]
-                        if date_from <= item_date_str <= date_to:
-                            money_spent_str = item.get("moneySpent")
-                            if money_spent_str is not None:
-                                try:
-                                    money_spent = float(money_spent_str.replace(",", "."))
-                                    total_expense += money_spent
-                                except:
-                                    pass
-        save_to_cache(cache_key, total_expense)
-        return total_expense
+        rows = data.get("rows", [])
+        total = sum(float(row.get("expense", 0)) for row in rows)
+        return total
     except Exception as e:
-        write_log(f"❌ Ошибка получения рекламных расходов: {e}")
+        write_log(f"❌ Ошибка загрузки расходов на рекламу: {e}")
         return 0.0
 
 def fetch_advertising_expense(date_from, date_to):
-    # Добавляем кэширование для всего периода (Шаг 1)
-    cache_key = f"fetch_advertising_expense_{date_from}_{date_to}"
+    """Получение расходов на рекламу с кэшированием"""
+    cache_key = f"ad_expense_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
     if cached is not None:
+        write_log(f"📢 Используем кэш для расходов на рекламу {date_from}–{date_to}")
         return cached
-
+    
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
-    today = get_moscow_today()
-    if start_dt.date() > today:
-        return 0.0
-    if end_dt.date() > today:
-        end_dt = datetime.datetime.combine(today, datetime.time(23, 59, 59))
-
     delta = (end_dt - start_dt).days
+    
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        result = fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = fetch_advertising_expense_single(date_from, date_to)
         save_to_cache(cache_key, result)
         return result
-
-    total = 0.0
+    
+    total_expense = 0.0
     current = start_dt.replace(day=1)
+    
     while current <= end_dt:
         month_start = current.strftime("%Y-%m-%d")
         next_month = current.replace(day=28) + datetime.timedelta(days=4)
         month_end = (next_month - datetime.timedelta(days=next_month.day)).strftime("%Y-%m-%d")
-        if month_end > end_dt.strftime("%Y-%m-%d"):
-            month_end = end_dt.strftime("%Y-%m-%d")
-        if current.date() > today:
-            break
-        write_log(f"📊 Запрос рекламы за {month_start}–{month_end}")
-        total += fetch_advertising_expense_single(month_start, month_end)
+        if month_end > date_to:
+            month_end = date_to
+        
+        write_log(f"📢 Запрос рекламы за {month_start}–{month_end}")
+        total_expense += fetch_advertising_expense_single(month_start, month_end)
+        
         current = current.replace(day=28) + datetime.timedelta(days=4)
         current = current.replace(day=1)
-    save_to_cache(cache_key, total)
-    return total
+    
+    write_log(f"📢 Всего расходов на рекламу: {total_expense:.2f} ₽ за {date_from}–{date_to}")
+    save_to_cache(cache_key, total_expense)
+    return total_expense
 
-# ---------- Функции для финансовых транзакций с разбивкой по месяцам ----------
 def fetch_finance_transactions_single(date_from, date_to):
-    cache_key = f"fetch_finance_transactions_single_{date_from}_{date_to}"
-    cached = get_from_cache(cache_key)
-    if cached is not None:
-        return cached
-
-    today_str = get_moscow_today().isoformat()
-    if date_from > today_str:
-        return []
-    if date_to > today_str:
-        date_to = today_str
-
+    """Получение финансовых транзакций за период"""
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
     }
-
-    from_iso = date_from + "T00:00:00.000Z"
-    to_iso = date_to + "T23:59:59.999Z"
-
     all_transactions = []
     page = 1
     page_size = 1000
-
+    
     while True:
         payload = {
             "filter": {
                 "date": {
-                    "from": from_iso,
-                    "to": to_iso
-                }
+                    "from": f"{date_from}T00:00:00.000Z",
+                    "to": f"{date_to}T23:59:59.999Z"
+                },
+                "transaction_type": "all"
             },
             "page": page,
-            "page_size": page_size,
+            "page_size": page_size
         }
-
         try:
-            response = api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
+            response = api_request_with_retry(OZON_FINANCE_URL, headers, payload)
             data = response.json()
-            items = data.get("result", {}).get("operations", [])
-            if not items:
-                break
-            all_transactions.extend(items)
-            if len(items) < page_size:
+            operations = data.get("result", {}).get("operations", [])
+            all_transactions.extend(operations)
+            if len(operations) < page_size:
                 break
             page += 1
-
         except Exception as e:
-            write_log(f"❌ Ошибка получения финансовых транзакций: {e}")
+            write_log(f"❌ Ошибка загрузки финансов: {e}")
             break
-
-    save_to_cache(cache_key, all_transactions)
+    
     return all_transactions
 
 def fetch_finance_transactions(date_from, date_to):
-    # Добавляем кэширование для всего периода (Шаг 1)
-    cache_key = f"fetch_finance_transactions_{date_from}_{date_to}"
+    """Получение финансовых транзакций с кэшированием"""
+    cache_key = f"finance_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
     if cached is not None:
+        write_log(f"💰 Используем кэш для финансов {date_from}–{date_to}")
         return cached
-
+    
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
     today = get_moscow_today()
+    
     if start_dt.date() > today:
         return []
     if end_dt.date() > today:
         end_dt = datetime.datetime.combine(today, datetime.time(23, 59, 59))
 
     delta = (end_dt - start_dt).days
+    
     if delta <= API_MAX_DAYS_PER_REQUEST:
         result = fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
         save_to_cache(cache_key, result)
@@ -554,6 +520,7 @@ def fetch_finance_transactions(date_from, date_to):
 
     all_transactions = []
     current = start_dt.replace(day=1)
+    
     while current <= end_dt:
         month_start = current.strftime("%Y-%m-%d")
         next_month = current.replace(day=28) + datetime.timedelta(days=4)
@@ -562,8 +529,10 @@ def fetch_finance_transactions(date_from, date_to):
             month_end = end_dt.strftime("%Y-%m-%d")
         if current.date() > today:
             break
+        
         write_log(f"💰 Запрос финансов за {month_start}–{month_end}")
         all_transactions.extend(fetch_finance_transactions_single(month_start, month_end))
+        
         current = current.replace(day=28) + datetime.timedelta(days=4)
         current = current.replace(day=1)
 
@@ -571,22 +540,22 @@ def fetch_finance_transactions(date_from, date_to):
     save_to_cache(cache_key, all_transactions)
     return all_transactions
 
-# ---------- АГРЕГАЦИЯ ФИНАНСОВЫХ РАСХОДОВ (без доходов) ----------
 def aggregate_finance_expenses(transactions):
-    # Оптимизация: сбор примеров без логирования внутри цикла (Шаг 3)
+    """
+    Агрегация финансовых расходов (оптимизированная версия)
+    """
     expense_by_type = {}
     unique_types = set()
     unique_services = set()
-    sample_transactions = []
-
+    sample_transactions = []  # Собираем примеры для логирования
+    
     for t in transactions:
-        # Собираем примеры для логирования (без I/O)
+        # Только сбор данных, без I/O
         if len(sample_transactions) < DEBUG_SAMPLE_SIZE:
             services = t.get("services", [])
             if services:
                 sample_transactions.append(t)
 
-        # Обработка расходов
         sale_comm = t.get("sale_commission", 0)
         if sale_comm < 0:
             expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
@@ -620,13 +589,14 @@ def aggregate_finance_expenses(transactions):
                     has_negative_service = True
                     unique_services.add(service_name)
                     expense_by_type[service_name] = expense_by_type.get(service_name, 0) + abs(service_amount)
+            
             if not has_negative_service and amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
         else:
             if amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
 
-    # Логируем примеры транзакций одним блоком после цикла
+    # Логируем ПОСЛЕ цикла одним блоком
     if sample_transactions:
         for t in sample_transactions:
             services = t.get("services", [])
@@ -641,312 +611,21 @@ def aggregate_finance_expenses(transactions):
 
     return expense_by_type
 
-# ---------- ФУНКЦИИ ДЛЯ ТОВАРНОЙ АНАЛИТИКИ (с offer_id) ----------
-def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
-    """Агрегирует данные по товарам за период, сохраняя offer_id"""
-    product_stats = {}
-    for posting in postings:
-        created_at = posting.get("created_at", "")
-        if not created_at:
-            continue
-        try:
-            dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            dt_msk = dt.astimezone(MOSCOW_TZ)
-        except:
-            continue
-        date_str = dt_msk.date().isoformat()
-        if date_from and date_str < date_from:
-            continue
-        if date_to and date_str > date_to:
-            continue
-        if time_limit is not None and apply_limit_on_day is not None and date_str == apply_limit_on_day:
-            if dt_msk.time() > time_limit:
-                continue
-
-        status = posting.get("status", "")
-        products = posting.get("products", [])
-        for product in products:
-            sku = str(product.get("sku", "0"))
-            name = product.get("name", "Без названия")
-            offer_id = product.get("offer_id", "")  # артикул продавца
-            qty = int(product.get("quantity", 0))
-            price_str = product.get("price", "0")
-            try:
-                price = float(price_str)
-            except:
-                price = 0.0
-
-            if sku not in product_stats:
-                product_stats[sku] = {
-                    "name": name[:60],
-                    "offer_id": offer_id,
-                    "ordered_units": 0,
-                    "ordered_sum": 0.0,
-                    "delivered_units": 0,
-                    "delivered_sum": 0.0,
-                    "canceled_units": 0,
-                    "canceled_sum": 0.0,
-                    "order_count": 0,
-                }
-            stats = product_stats[sku]
-            stats["ordered_units"] += qty
-            stats["ordered_sum"] += price * qty
-            stats["order_count"] += 1
-
-            if status in ("delivered", "completed"):
-                stats["delivered_units"] += qty
-                stats["delivered_sum"] += price * qty
-            elif status in ("cancelled", "canceled"):
-                stats["canceled_units"] += qty
-                stats["canceled_sum"] += price * qty
-
-    return product_stats
-
-def format_top_products(products, title, limit=15):
-    """Формирует текстовый отчёт по товарам (без Markdown)"""
-    if not products:
-        return f"📦 {title}\n\n❌ Нет данных за указанный период."
-
-    sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:limit]
-    lines = [f"📦 {title}", ""]
-    for idx, (sku, stats) in enumerate(sorted_items, 1):
-        name = stats["name"][:40]
-        offer_id = stats.get("offer_id", "")
-        ordered_sum = f"{stats['ordered_sum']:,.2f}".replace(",", " ")
-        ordered_units = stats["ordered_units"]
-        delivered_sum = f"{stats['delivered_sum']:,.2f}".replace(",", " ")
-        delivered_units = stats["delivered_units"]
-        canceled_sum = f"{stats['canceled_sum']:,.2f}".replace(",", " ")
-        canceled_units = stats["canceled_units"]
-        avg_check = (stats["ordered_sum"] / stats["order_count"]) if stats["order_count"] > 0 else 0
-        avg_check_str = f"{avg_check:,.2f}".replace(",", " ")
-        lines.append(f"{idx}. SKU: {sku} | {name} | Арт: {offer_id}" if offer_id else f"{idx}. SKU: {sku} | {name}")
-        lines.append(f"   🛒 Заказано: {ordered_sum} ₽ / {ordered_units} шт.")
-        lines.append(f"   📦 Доставлено: {delivered_sum} ₽ / {delivered_units} шт.")
-        lines.append(f"   ❌ Отменено: {canceled_sum} ₽ / {canceled_units} шт.")
-        lines.append(f"   💰 Средний чек: {avg_check_str} ₽")
-        lines.append("")
-    return "\n".join(lines)
-
-def format_products_summary(products):
-    if not products:
-        return "Нет данных"
-    total_revenue = sum(p["ordered_sum"] for p in products.values())
-    total_units = sum(p["ordered_units"] for p in products.values())
-    total_orders = sum(p["order_count"] for p in products.values())
-    avg_check = (total_revenue / total_orders) if total_orders > 0 else 0
-    return (
-        f"Сводка\n"
-        f"  Уникальных товаров: {len(products)}\n"
-        f"  Общая выручка: {total_revenue:,.2f} ₽\n"
-        f"  Всего единиц: {total_units}\n"
-        f"  Всего заказов: {total_orders}\n"
-        f"  Средний чек: {avg_check:,.2f} ₽"
+# ==================== ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ ====================
+async def get_metrics_for_period_async(date_from, date_to):
+    """
+    Асинхронная версия get_metrics_for_period с параллельными запросами
+    """
+    loop = asyncio.get_event_loop()
+    
+    # Запускаем все запросы параллельно
+    postings, ad_expense, transactions = await asyncio.gather(
+        loop.run_in_executor(executor, fetch_postings, date_from, date_to),
+        loop.run_in_executor(executor, fetch_advertising_expense, date_from, date_to),
+        loop.run_in_executor(executor, fetch_finance_transactions, date_from, date_to)
     )
-
-def get_top_products_for_select(days=30):
-    """Возвращает топ-20 товаров за последние N дней с offer_id для выбора"""
-    now = get_current_time_msk()
-    end_date = now.date().isoformat()
-    start_date = (now.date() - datetime.timedelta(days=days)).isoformat()
-    postings = fetch_postings(start_date, end_date)
-    products = aggregate_products(postings, date_from=start_date, date_to=end_date,
-                                  time_limit=now.time(), apply_limit_on_day=end_date)
-    sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:20]
-    return [(sku, stats) for sku, stats in sorted_items]
-
-def generate_product_chart_by_metric(sku, metric, years):
-    """
-    Строит график для одного товара, метрики и списка годов.
-    metric: 'ordered_sum', 'ordered_units', 'delivered_sum', 'delivered_units', 'canceled_sum', 'canceled_units', 'avg_check'
-    years: список годов
-    Возвращает BytesIO с изображением или None
-    """
-    data = {}
-    for year in years:
-        start_date = datetime.date(year, 1, 1).isoformat()
-        end_date = datetime.date(year, 12, 31).isoformat()
-        postings = fetch_postings(start_date, end_date)
-        monthly_data = {m: 0.0 for m in range(12)}
-        order_counts = {m: 0 for m in range(12)}
-        for posting in postings:
-            created_at = posting.get("created_at", "")
-            if not created_at:
-                continue
-            try:
-                dt = datetime.datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                dt_msk = dt.astimezone(MOSCOW_TZ)
-            except:
-                continue
-            if dt_msk.year != year:
-                continue
-            month_idx = dt_msk.month - 1
-            products = posting.get("products", [])
-            for product in products:
-                if str(product.get("sku", "0")) != sku:
-                    continue
-                qty = int(product.get("quantity", 0))
-                price_str = product.get("price", "0")
-                try:
-                    price = float(price_str)
-                except:
-                    price = 0.0
-                status = posting.get("status", "")
-                # Собираем значения по метрике
-                if metric == 'ordered_sum':
-                    monthly_data[month_idx] += price * qty
-                elif metric == 'ordered_units':
-                    monthly_data[month_idx] += qty
-                elif metric == 'delivered_sum' and status in ("delivered", "completed"):
-                    monthly_data[month_idx] += price * qty
-                elif metric == 'delivered_units' and status in ("delivered", "completed"):
-                    monthly_data[month_idx] += qty
-                elif metric == 'canceled_sum' and status in ("cancelled", "canceled"):
-                    monthly_data[month_idx] += price * qty
-                elif metric == 'canceled_units' and status in ("cancelled", "canceled"):
-                    monthly_data[month_idx] += qty
-                elif metric == 'avg_check':
-                    monthly_data[month_idx] += price * qty
-                    order_counts[month_idx] += 1
-        if metric == 'avg_check':
-            for m in range(12):
-                if order_counts[m] > 0:
-                    monthly_data[m] = monthly_data[m] / order_counts[m]
-                else:
-                    monthly_data[m] = 0.0
-        data[year] = [monthly_data[i] for i in range(12)]
-
-    if not any(any(v > 0 for v in vals) for vals in data.values()):
-        return None
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    months = [datetime.date(2000, m, 1) for m in range(1, 13)]
-
-    metric_labels = {
-        'ordered_sum': 'Заказано (₽)',
-        'ordered_units': 'Заказано (шт.)',
-        'delivered_sum': 'Доставлено (₽)',
-        'delivered_units': 'Доставлено (шт.)',
-        'canceled_sum': 'Отменено (₽)',
-        'canceled_units': 'Отменено (шт.)',
-        'avg_check': 'Средний чек (₽)'
-    }
-    ylabel = metric_labels.get(metric, 'Значение')
-
-    for year, values in data.items():
-        ax.plot(months, values, marker='o', label=str(year), linewidth=2)
-
-    ax.set_title(f"Динамика по товару (SKU: {sku})", fontsize=14)
-    ax.set_xlabel("Месяц")
-    ax.set_ylabel(ylabel)
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
-    ax.grid(True, linestyle='--', alpha=0.7)
-    ax.legend()
-    if metric in ['ordered_sum', 'delivered_sum', 'canceled_sum', 'avg_check']:
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'.replace(',', ' ')))
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-# ---------- ФОРМАТИРОВАНИЕ БЛОКОВ (продажи – с Markdown) ----------
-def format_expense_block(expenses_by_type, title):
-    if not expenses_by_type:
-        return f"🔹 *{title}*\nНет данных о расходах.\n"
-
-    total = sum(expenses_by_type.values())
-    lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
-
-    name_map = {
-        "Комиссия Ozon": "Комиссия",
-        "Оплата эквайринга": "Эквайринг",
-        "Доставка покупателю": "Доставка покупателю",
-        "Доставка и обработка возврата, отмены, невыкупа": "Доставка/возвраты",
-        "Кросс-докинг": "Кросс-докинг",
-        "Страхование товара от массовых повреждений": "Страхование",
-        "Обеспечение материалами для упаковки товара": "Обеспечение упаковкой",
-        "Упаковка товара партнёрами": "Упаковка",
-        "Подписка Управление отзывами": "Подписка",
-        "Оплата за клик": "Оплата за клик",
-        "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
-        "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
-        "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
-        "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
-        "MarketplaceServiceItemDeliveryToHandoverPlaceOzon": "Доставка до ПВЗ",
-        "MarketplaceRedistributionOfAcquiringOperation": "Эквайринг",
-        "MarketplaceServiceItemRedistributionReturnsPVZ": "Обработка возвратов (ПВЗ)",
-        "MarketplaceServiceItemPackageRedistribution": "Переупаковка",
-        "MarketplaceServiceItemPackageMaterialsProvision": "Обеспечение упаковкой",
-        "MarketplaceServiceItemProductReviewsManagementSubscription": "Подписка",
-        "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля (ПВЗ)",
-        "MarketplaceServiceItemDirectFlowLogisticFBS": "Логистика прямая (FBS)",
-        "MarketplaceServiceItemReturnFlowLogisticFBS": "Логистика возврат (FBS)",
-        "ItemAgentServiceStarsMembership": "Звёздные товары",
-        "MarketplaceServiceSellerReturnsCargoAssortment": "Обработка возвратов партнёрами",
-        "MarketplaceServiceItemTemporaryStorageRedistribution": "Временное размещение",
-        "MarketplaceServiceProductMovementFromWarehouse": "Вывоз до ПВЗ",
-        "MarketplaceServiceItemDisposalDetailed": "Утилизация",
-        "Звёздные товары": "Звёздные товары",
-        "Временное размещение товара партнерами": "Временное размещение",
-        "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
-        "Обработка товара в составе грузоместа на FBO": "Поштучная приёмка",
-        "Подготовка товара к вывозу: Брак": "Подготовка к вывозу (брак)",
-        "Вывоз товара со склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
-        "Вывоз товара со Склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
-        "Бронирование места и персонала для поставки с неполным составом в составе грузоместа": "Бронирование места",
-        "Услуга по бронированию места и персонала для поставки с неполным составом в составе ГМ": "Бронирование места",
-        "Обработка опознанных излишков в составе грузоместа": "Обработка излишков",
-        "Услуга по обработке опознанных излишков в составе ГМ": "Обработка излишков",
-        "Утилизация товара: Пролились/просыпались из-за упаковки": "Утилизация",
-        "Потеря по вине Ozon на складе": "Потеря (склад)",
-        "Потеря по вине Ozon в логистике": "Потеря (логистика)",
-        "Вознаграждение за продажу": "Вознаграждение",
-        "Возврат вознаграждения": "Возврат вознаграждения",
-        "Программы партнёров": "Программы партнёров",
-        "Баллы за скидки": "Баллы за скидки",
-        "Выручка": "Выручка",
-        "Возврат выручки": "Возврат выручки",
-        "Реклама": "Реклама",
-    }
-
-    sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
-
-    for category, amount in sorted_items:
-        if category in name_map:
-            short_name = name_map[category]
-        else:
-            found = False
-            for key, value in name_map.items():
-                if key in category or category in key:
-                    short_name = value
-                    found = True
-                    break
-            if not found:
-                short_name = category[:40]
-                write_log(f"⚠️ Не найдено соответствие для категории: {category}")
-        lines.append(f"    {short_name}: {amount:,.2f} ₽")
-
-    return "\n".join(lines)
-
-# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ (Шаг 4) ----------
-def fetch_metrics_parallel(date_from, date_to):
-    """Параллельно загружает отгрузки, рекламу и финансовые транзакции для указанного периода."""
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_postings = executor.submit(fetch_postings, date_from, date_to)
-        future_ad = executor.submit(fetch_advertising_expense, date_from, date_to)
-        future_finance = executor.submit(fetch_finance_transactions, date_from, date_to)
-        postings = future_postings.result()
-        ad_expense = future_ad.result()
-        transactions = future_finance.result()
-    return postings, ad_expense, transactions
-
-def fetch_metrics_for_period_parallel(date_from, date_to):
-    """Обёртка для получения агрегированных метрик с параллельными запросами."""
-    postings, ad_expense, transactions = fetch_metrics_parallel(date_from, date_to)
+    
+    # Обрабатываем результаты
     agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
     total = {
         "ordered_units": 0,
@@ -956,15 +635,19 @@ def fetch_metrics_for_period_parallel(date_from, date_to):
         "canceled_units": 0,
         "canceled_sum": 0.0,
     }
+    
     for vals in agg.values():
         for key in total:
             total[key] += vals.get(key, 0)
+    
     total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+    
     revenue = total.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
         total["drr"] = (ad_expense / revenue) * 100
     else:
         total["drr"] = None
+    
     delivered_revenue = total.get("delivered_sum", 0)
     if delivered_revenue > 0 and ad_expense is not None:
         total["effective_drr"] = (ad_expense / delivered_revenue) * 100
@@ -973,1848 +656,474 @@ def fetch_metrics_for_period_parallel(date_from, date_to):
 
     expenses = aggregate_finance_expenses(transactions)
     total["expenses"] = expenses
+    
     return total
 
-# ---------- Остальные вспомогательные функции ----------
+def get_metrics_for_period(date_from, date_to):
+    """Синхронная обертка для асинхронной функции"""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    
+    return loop.run_until_complete(get_metrics_for_period_async(date_from, date_to))
+
+# ==================== ТОП ТОВАРОВ ====================
+def get_top_products(postings, limit=10):
+    """Получить топ товаров по продажам"""
+    product_stats = {}
+    
+    for posting in postings:
+        if posting.get('status') != 'delivered':
+            continue
+            
+        for product in posting.get('products', []):
+            offer_id = product.get('offer_id')
+            price = float(product.get('price', 0))
+            quantity = int(product.get('quantity', 0))
+            revenue = price * quantity
+            
+            if offer_id not in product_stats:
+                product_stats[offer_id] = {
+                    'name': product.get('name', offer_id),
+                    'units_sold': 0,
+                    'revenue': 0
+                }
+            
+            product_stats[offer_id]['units_sold'] += quantity
+            product_stats[offer_id]['revenue'] += revenue
+    
+    # Сортируем по выручке
+    top_by_revenue = sorted(
+        product_stats.items(),
+        key=lambda x: x[1]['revenue'],
+        reverse=True
+    )[:limit]
+    
+    return top_by_revenue
+
+# ==================== ФОРМАТИРОВАНИЕ ====================
+def format_expense_block(expenses):
+    if not expenses:
+        return "  (нет данных о расходах)"
+    lines = []
+    for category, amount in sorted(expenses.items(), key=lambda x: -x[1]):
+        lines.append(f"    • {category}: {amount:,.2f} ₽")
+    return "\n".join(lines)
+
 def get_current_time_msk():
-    return datetime.datetime.now(MOSCOW_TZ)
+    now = datetime.datetime.now(MOSCOW_TZ)
+    return now.strftime("%d.%m.%Y %H:%M:%S")
 
-def format_combined_metrics_with_deltas(include_yesterday=False):
-    now = get_current_time_msk()
-    today_date = now.date()
-    current_time = now.time()
-    today_str = today_date.isoformat()
-    yesterday_date = today_date - datetime.timedelta(days=1)
-    yesterday_str = yesterday_date.isoformat()
-
-    current_month_start = today_date.replace(day=1)
-    current_month_start_str = current_month_start.isoformat()
-    current_month_end_str = today_str
-
-    previous_month_start = (current_month_start - datetime.timedelta(days=1)).replace(day=1)
-    previous_month_start_str = previous_month_start.isoformat()
-    previous_month_end = current_month_start - datetime.timedelta(days=1)
-    previous_month_end_str = previous_month_end.isoformat()
-
-    days_passed = (today_date - current_month_start).days + 1
-
-    # Параллельные запросы для текущего и предыдущего месяцев
-    # Для текущего месяца запрашиваем данные с начала до сегодня (включая сегодня с ограничением по времени)
-    # Для предыдущего месяца - аналогичный период
-    # Также запрашиваем отдельно для сегодня и вчера
-    # Используем параллельную загрузку для каждого периода отдельно, чтобы не смешивать
-
-    # Загружаем данные для текущего месяца
-    postings_current = fetch_postings(current_month_start_str, current_month_end_str)
-    # Загружаем данные для предыдущего месяца
-    postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
-
-    # Агрегация для вчера и сегодня с учётом времени
-    agg_yesterday_full = aggregate_postings(
-        postings_current,
-        date_from=yesterday_str,
-        date_to=yesterday_str
-    )
-    yesterday_full_metrics = agg_yesterday_full.get(yesterday_str, {}) if yesterday_str in agg_yesterday_full else {}
-
-    agg_today = aggregate_postings(
-        postings_current,
-        date_from=today_str,
-        date_to=today_str,
-        time_limit=current_time,
-        apply_limit_on_day=today_str
-    )
-    today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
-
-    agg_yesterday = aggregate_postings(
-        postings_current,
-        date_from=yesterday_str,
-        date_to=yesterday_str,
-        time_limit=current_time,
-        apply_limit_on_day=yesterday_str
-    )
-    yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
-
-    agg_current_month = aggregate_postings(
-        postings_current,
-        date_from=current_month_start_str,
-        date_to=current_month_end_str,
-        time_limit=current_time,
-        apply_limit_on_day=today_str
-    )
-    month_metrics = {
-        "ordered_units": 0,
-        "ordered_sum": 0.0,
-        "delivered_units": 0,
-        "delivered_sum": 0.0,
-        "canceled_units": 0,
-        "canceled_sum": 0.0,
-    }
-    for vals in agg_current_month.values():
-        for key in month_metrics:
-            month_metrics[key] += vals.get(key, 0)
-
-    prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
-    prev_period_end_str = prev_period_end.isoformat()
-    agg_prev_month = aggregate_postings(
-        postings_prev,
-        date_from=previous_month_start_str,
-        date_to=prev_period_end_str,
-        time_limit=current_time,
-        apply_limit_on_day=prev_period_end_str
-    )
-    prev_month_metrics = {
-        "ordered_units": 0,
-        "ordered_sum": 0.0,
-        "delivered_units": 0,
-        "delivered_sum": 0.0,
-        "canceled_units": 0,
-        "canceled_sum": 0.0,
-    }
-    for vals in agg_prev_month.values():
-        for key in prev_month_metrics:
-            prev_month_metrics[key] += vals.get(key, 0)
-
-    # Рекламные расходы и финансы - параллельно для всех нужных периодов
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_ad_today = executor.submit(fetch_advertising_expense, today_str, today_str)
-        future_ad_yesterday = executor.submit(fetch_advertising_expense, yesterday_str, yesterday_str)
-        future_ad_month = executor.submit(fetch_advertising_expense, current_month_start_str, today_str)
-        future_ad_prev = executor.submit(fetch_advertising_expense, previous_month_start_str, prev_period_end_str)
-        future_fin_today = executor.submit(fetch_finance_transactions, today_str, today_str)
-        future_fin_month = executor.submit(fetch_finance_transactions, current_month_start_str, today_str)
-
-        ad_today = future_ad_today.result()
-        ad_yesterday = future_ad_yesterday.result()
-        ad_month = future_ad_month.result()
-        ad_prev_period = future_ad_prev.result()
-        fin_today = future_fin_today.result()
-        fin_month = future_fin_month.result()
-
-    expenses_today = aggregate_finance_expenses(fin_today)
-    expenses_month = aggregate_finance_expenses(fin_month)
-
-    # Добавляем рекламу в расходы
-    if ad_today > 0:
-        expenses_today["Реклама"] = ad_today
-    if ad_month > 0:
-        expenses_month["Реклама"] = ad_month
-
-    # Остальной код без изменений (форматирование)
-    def fmt_num(val):
-        return f"{val:,.2f}".replace(",", " ") if val else "0.00"
-
-    def fmt_int(val):
-        return str(val) if val else "0"
-
-    def fmt_pct(val):
-        if val is None:
-            return "∞"
-        if val > 0:
-            return f"+{val:.1f}%"
-        elif val < 0:
-            return f"{val:.1f}%"
-        else:
-            return f"{val:.1f}%"
-
-    def calc_delta(current, previous):
-        if previous == 0:
-            return None
-        try:
-            return ((current - previous) / abs(previous)) * 100
-        except:
-            return None
-
-    d_ord_sum = calc_delta(today_metrics.get("ordered_sum", 0), yesterday_metrics.get("ordered_sum", 0))
-    d_ord_units = calc_delta(today_metrics.get("ordered_units", 0), yesterday_metrics.get("ordered_units", 0))
-    d_ad = calc_delta(ad_today, ad_yesterday)
-
-    d_ord_sum_m = calc_delta(month_metrics.get("ordered_sum", 0), prev_month_metrics.get("ordered_sum", 0))
-    d_ord_units_m = calc_delta(month_metrics.get("ordered_units", 0), prev_month_metrics.get("ordered_units", 0))
-    d_del_sum_m = calc_delta(month_metrics.get("delivered_sum", 0), prev_month_metrics.get("delivered_sum", 0))
-    d_del_units_m = calc_delta(month_metrics.get("delivered_units", 0), prev_month_metrics.get("delivered_units", 0))
-    d_can_sum_m = calc_delta(month_metrics.get("canceled_sum", 0), prev_month_metrics.get("canceled_sum", 0))
-    d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
-    d_ad_m = calc_delta(ad_month, ad_prev_period)
-
-    def format_today_block():
-        ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
-        ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
-        canceled_sum = fmt_num(today_metrics.get("canceled_sum", 0))
-        canceled_units = fmt_int(today_metrics.get("canceled_units", 0))
-
-        delta_ord_sum = fmt_pct(d_ord_sum)
-        delta_ord_units = fmt_pct(d_ord_units)
-        delta_can_sum = fmt_pct(calc_delta(today_metrics.get("canceled_sum", 0), yesterday_metrics.get("canceled_sum", 0)))
-        delta_can_units = fmt_pct(calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0)))
-
-        return (
-            f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
-            f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n"
-            f"    vs Вчера: \n  {delta_ord_sum} ₽ / {delta_ord_units} шт.\n\n"
-            f"  ❌ Отменено: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
-            f"    vs Вчера: \n  {delta_can_sum} ₽ / {delta_can_units} шт."
-        )
-
-    def format_month_block():
-        ordered_sum = fmt_num(month_metrics.get("ordered_sum", 0))
-        ordered_units = fmt_int(month_metrics.get("ordered_units", 0))
-        delivered_sum = fmt_num(month_metrics.get("delivered_sum", 0))
-        delivered_units = fmt_int(month_metrics.get("delivered_units", 0))
-        canceled_sum = fmt_num(month_metrics.get("canceled_sum", 0))
-        canceled_units = fmt_int(month_metrics.get("canceled_units", 0))
-        ad_expense = fmt_num(ad_month)
-        ad_prev = fmt_num(ad_prev_period)
-
-        revenue = month_metrics.get("ordered_sum", 0)
-        drr = (ad_month / revenue * 100) if revenue > 0 else None
-        delivered_revenue = month_metrics.get("delivered_sum", 0)
-        eff_drr = (ad_month / delivered_revenue * 100) if delivered_revenue > 0 else None
-
-        prev_rev = prev_month_metrics.get("ordered_sum", 0)
-        prev_del_rev = prev_month_metrics.get("delivered_sum", 0)
-        prev_drr_val = (ad_prev_period / prev_rev * 100) if prev_rev > 0 else None
-        prev_eff_drr_val = (ad_prev_period / prev_del_rev * 100) if prev_del_rev > 0 else None
-
-        drr_str = f"{drr:.2f}%" if drr is not None else "∞"
-        eff_drr_str = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
-        prev_drr_str = f"{prev_drr_val:.2f}%" if prev_drr_val is not None else "∞"
-        prev_eff_drr_str = f"{prev_eff_drr_val:.2f}%" if prev_eff_drr_val is not None else "∞"
-
-        delta_ord_sum_m = fmt_pct(d_ord_sum_m)
-        delta_ord_units_m = fmt_pct(d_ord_units_m)
-        delta_del_sum_m = fmt_pct(d_del_sum_m)
-        delta_del_units_m = fmt_pct(d_del_units_m)
-        delta_can_sum_m = fmt_pct(d_can_sum_m)
-        delta_can_units_m = fmt_pct(d_can_units_m)
-
-        return (
-            f"🔹 *Текущий месяц*\n"
-            f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n"
-            f"    vs предыдущий месяц: \n  {delta_ord_sum_m} ₽ / {delta_ord_units_m} шт.\n\n"
-            f"  📦 Доставлено: \n  {delivered_sum} ₽ / {delivered_units} шт.\n"
-            f"    vs предыдущий месяц: \n  {delta_del_sum_m} ₽ / {delta_del_units_m} шт.\n\n"
-            f"  ❌ Отменено: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
-            f"    vs предыдущий месяц: \n  {delta_can_sum_m} ₽ / {delta_can_units_m} шт.\n\n"
-            f"  📢 Реклама: \n  {ad_expense} ₽ | vs предыдущий месяц: {ad_prev} ₽\n"
-            f"  ДРР (общий): {drr_str} | vs предыдущий месяц: {prev_drr_str}\n"
-            f"  ДРР (по доставленным): {eff_drr_str} | vs предыдущий месяц: {prev_eff_drr_str}"
-        )
-
-    parts = []
-    parts.append(format_today_block())
-    parts.append(format_month_block())
-
-    parts.append(format_expense_block(expenses_today, "Расходы сегодня"))
-    parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц"))
-
-    return "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
-
-# ---------- Функции для динамики продаж (график) ----------
-def get_monthly_delivered_sum(year):
-    start_date = datetime.date(year, 1, 1).isoformat()
-    end_date = datetime.date(year, 12, 31).isoformat()
-    postings = fetch_postings(start_date, end_date)
-    daily_agg = aggregate_postings(postings, date_from=start_date, date_to=end_date)
-    monthly = [0.0] * 12
-    for date_str, vals in daily_agg.items():
-        try:
-            dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
-            month_idx = dt.month - 1
-            monthly[month_idx] += vals.get("delivered_sum", 0.0)
-        except:
-            continue
-    return monthly
-
-def generate_sales_chart(years_list):
-    if not years_list:
-        return None
-    data = {}
-    for year in years_list:
-        data[year] = get_monthly_delivered_sum(year)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    months = [datetime.date(2000, m, 1) for m in range(1, 13)]
-    for year, values in data.items():
-        ax.plot(months, values, marker='o', label=str(year), linewidth=2)
-
-    ax.set_title("Динамика доставленных заказов (сумма, руб.)", fontsize=14)
-    ax.set_xlabel("Месяц")
-    ax.set_ylabel("Сумма доставленных заказов, ₽")
-    ax.xaxis.set_major_locator(mdates.MonthLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
-    ax.grid(True, linestyle='--', alpha=0.7)
-    ax.legend()
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'.replace(',', ' ')))
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100)
-    buf.seek(0)
-    plt.close(fig)
-    return buf
-
-# ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ (продажи) ----------
-def format_single_metrics(metrics, title):
-    if not metrics:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-    has_data = False
-    for key, val in metrics.items():
-        if key in ["drr", "effective_drr", "ad_expense", "expenses"]:
-            continue
-        if isinstance(val, (int, float)) and val != 0:
-            has_data = True
-            break
-    if not has_data:
-        return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
-
-    ad_expense = metrics.get("ad_expense", 0)
-    drr = metrics.get("drr")
-    eff_drr = metrics.get("effective_drr")
+def format_metrics_message(date_str, metrics):
+    """Форматирование метрик"""
+    lines = []
+    lines.append(f"<b>📊 Метрики за {date_str}</b>\n")
+    
+    lines.append(f"<b>🛒 Продажи:</b>")
+    lines.append(f"  Заказано: {metrics.get('ordered_units', 0)} шт / {metrics.get('ordered_sum', 0):,.2f} ₽")
+    lines.append(f"  Доставлено: {metrics.get('delivered_units', 0)} шт / {metrics.get('delivered_sum', 0):,.2f} ₽")
+    lines.append(f"  Отменено: {metrics.get('canceled_units', 0)} шт / {metrics.get('canceled_sum', 0):,.2f} ₽\n")
+    
+    ad_expense = metrics.get('ad_expense', 0)
+    drr = metrics.get('drr')
+    eff_drr = metrics.get('effective_drr')
     drr_text = f"{drr:.2f}%" if drr is not None else "∞"
     eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
-
-    main_text = (
-        f"📊 *{title}*\n\n"
-        f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
-        f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
-        f"❌ *Отменено*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
-        f"📢 *Реклама*\n"
-        f"  Расходы: {ad_expense:,.2f} ₽\n"
-        f"  ДРР (общий): {drr_text}\n"
-        f"  ДРР (по доставленным): {eff_drr_text}"
-    )
-
-    expenses = metrics.get("expenses", {})
+    
+    lines.append(f"<b>📢 Реклама:</b>")
+    lines.append(f"  Расходы: {ad_expense:,.2f} ₽")
+    lines.append(f"  ДРР (общий): {drr_text}")
+    lines.append(f"  ДРР (по доставленным): {eff_drr_text}\n")
+    
+    expenses = metrics.get('expenses', {})
     if expenses:
-        expense_block = format_expense_block(expenses, "Расходы за период")
-        main_text += "\n\n" + expense_block
+        lines.append(f"<b>💸 Расходы (детализация):</b>")
+        lines.append(format_expense_block(expenses))
+    
+    return "\n".join(lines)
 
-    return main_text
-
-def get_metrics_for_date(date_str):
-    today = get_moscow_today()
-    start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
-    # Параллельно загружаем посты, рекламу и финансы за указанную дату
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        future_postings = executor.submit(fetch_postings, start, end)
-        future_ad = executor.submit(fetch_advertising_expense, date_str, date_str)
-        future_fin = executor.submit(fetch_finance_transactions, date_str, date_str)
-        postings = future_postings.result()
-        ad_expense = future_ad.result()
-        transactions = future_fin.result()
-
-    agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
-    metrics = agg.get(date_str, {})
-    metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
-    revenue = metrics.get("ordered_sum", 0)
-    if revenue > 0 and ad_expense is not None:
-        metrics["drr"] = (ad_expense / revenue) * 100
-    else:
-        metrics["drr"] = None
-    delivered_revenue = metrics.get("delivered_sum", 0)
-    if delivered_revenue > 0 and ad_expense is not None:
-        metrics["effective_drr"] = (ad_expense / delivered_revenue) * 100
-    else:
-        metrics["effective_drr"] = None
-
-    expenses = aggregate_finance_expenses(transactions)
-    metrics["expenses"] = expenses
-    return metrics
-
-def get_metrics_for_period(date_from, date_to):
-    # Используем параллельную версию
-    return fetch_metrics_for_period_parallel(date_from, date_to)
-
-# ---------- ТОВАРНЫЕ ОТЧЁТЫ ----------
-def get_product_data_for_date(date_str):
-    today = get_moscow_today()
-    start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
-    end = today.strftime("%Y-%m-%d")
-    postings = fetch_postings(start, end)
-    products = aggregate_products(postings, date_from=date_str, date_to=date_str)
-    return products
-
-def get_product_data_for_period(date_from, date_to):
-    postings = fetch_postings(date_from, date_to)
-    products = aggregate_products(postings, date_from=date_from, date_to=date_to)
-    return products
-
-def get_product_data_today():
-    now = get_current_time_msk()
-    today_str = now.date().isoformat()
-    postings = fetch_postings(today_str, today_str)
-    products = aggregate_products(postings, date_from=today_str, date_to=today_str,
-                                  time_limit=now.time(), apply_limit_on_day=today_str)
-    return products
-
-def get_product_data_month():
-    now = get_current_time_msk()
-    today_date = now.date()
-    current_month_start = today_date.replace(day=1).isoformat()
-    today_str = today_date.isoformat()
-    postings = fetch_postings(current_month_start, today_str)
-    products = aggregate_products(postings, date_from=current_month_start, date_to=today_str,
-                                  time_limit=now.time(), apply_limit_on_day=today_str)
-    return products
-
-def get_product_data_prev_month():
-    now = get_current_time_msk()
-    today_date = now.date()
-    current_month_start = today_date.replace(day=1)
-    previous_month_start = (current_month_start - datetime.timedelta(days=1)).replace(day=1)
-    days_passed = (today_date - current_month_start).days + 1
-    prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
-    prev_start_str = previous_month_start.isoformat()
-    prev_end_str = prev_period_end.isoformat()
-    postings = fetch_postings(prev_start_str, prev_end_str)
-    products = aggregate_products(postings, date_from=prev_start_str, date_to=prev_end_str,
-                                  time_limit=now.time(), apply_limit_on_day=prev_end_str)
-    return products
-
-def format_product_combined():
-    products_today = get_product_data_today()
-    products_month = get_product_data_month()
-    products_prev_month = get_product_data_prev_month()
-
-    parts = []
-    parts.append(format_top_products(products_today, "Топ товаров за сегодня", limit=15))
-    parts.append("")
-    parts.append(format_top_products(products_month, "Топ товаров за текущий месяц (аналог. период)", limit=15))
-    if products_prev_month:
-        parts.append("")
-        parts.append("Сравнение с предыдущим месяцем (аналог. период)")
-        total_rev_current = sum(p["ordered_sum"] for p in products_month.values())
-        total_rev_prev = sum(p["ordered_sum"] for p in products_prev_month.values())
-        total_units_current = sum(p["ordered_units"] for p in products_month.values())
-        total_units_prev = sum(p["ordered_units"] for p in products_prev_month.values())
-        delta_rev = ((total_rev_current - total_rev_prev) / total_rev_prev * 100) if total_rev_prev > 0 else None
-        delta_units = ((total_units_current - total_units_prev) / total_units_prev * 100) if total_units_prev > 0 else None
-        parts.append(f"  Выручка: {total_rev_current:,.2f} ₽ vs {total_rev_prev:,.2f} ₽ (Δ {delta_rev:.1f}%)" if delta_rev is not None else "  Выручка: нет данных")
-        parts.append(f"  Единиц: {total_units_current} vs {total_units_prev} (Δ {delta_units:.1f}%)" if delta_units is not None else "  Единиц: нет данных")
-
-    return "📦 Отчёт по товарам\n\n\n" + "\n\n".join(parts)
-
-# ---------- НОВАЯ КОМАНДА /топ_товары (Шаг 7) ----------
-async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not has_access(chat_id):
-        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
-        return
-
-    # Получаем данные за текущий месяц
-    now = get_current_time_msk()
-    today_date = now.date()
-    month_start = today_date.replace(day=1).isoformat()
-    today_str = today_date.isoformat()
-    postings = fetch_postings(month_start, today_str)
-    products = aggregate_products(postings, date_from=month_start, date_to=today_str,
-                                  time_limit=now.time(), apply_limit_on_day=today_str)
-
-    if not products:
-        await update.message.reply_text("❌ Нет данных о товарах за текущий месяц.")
-        return
-
-    # Формируем топ-10 по выручке
-    sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:10]
-    lines = ["🏆 <b>ТОП-10 ТОВАРОВ ЗА ТЕКУЩИЙ МЕСЯЦ</b>\n"]
-    for i, (sku, stats) in enumerate(sorted_items, 1):
-        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        name = stats.get("name", "Без названия")[:40]
-        offer_id = stats.get("offer_id", "")
-        revenue = stats["ordered_sum"]
-        units = stats["ordered_units"]
-        line = f"{medal} <b>{name}</b>"
-        if offer_id:
-            line += f" (Арт: {offer_id})"
-        line += f"\n   Выручка: {revenue:,.0f} ₽, шт: {units}\n"
-        lines.append(line)
-    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
-
-# ---------- КЛАВИАТУРЫ ----------
+# ==================== КЛАВИАТУРЫ ====================
 def main_admin_keyboard():
-    buttons = [
-        [KeyboardButton("📊 Отчёт по продажам")],
-        [KeyboardButton("📦 Отчёт по товарам")],
-        [KeyboardButton("⚙️ Администрирование")],
-        [KeyboardButton("📖 Справка")]
+    keyboard = [
+        [KeyboardButton("📊 Метрики за день"), KeyboardButton("📈 Метрики за период")],
+        [KeyboardButton("📅 Месяц"), KeyboardButton("🗓️ Квартал")],
+        [KeyboardButton("📆 Год"), KeyboardButton("📉 Динамика продаж")],
+        [KeyboardButton("🏆 Топ товары"), KeyboardButton("👥 Управление менеджерами")],
+        [KeyboardButton("ℹ️ Помощь")]
     ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def main_user_keyboard():
-    buttons = [
-        [KeyboardButton("📊 Отчёт по продажам")],
-        [KeyboardButton("📦 Отчёт по товарам")],
-        [KeyboardButton("📖 Справка")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def sales_reports_keyboard():
-    buttons = [
-        [KeyboardButton("📅 Продажи за сегодня")],
-        [KeyboardButton("📆 Выбрать дату")],
-        [KeyboardButton("📊 Выбрать период")],
-        [KeyboardButton("📈 Динамика продаж")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def products_reports_keyboard():
-    buttons = [
-        [KeyboardButton("📅 Топ товаров за сегодня")],
-        [KeyboardButton("📆 Выбрать дату (товары)")],
-        [KeyboardButton("📊 Выбрать период (товары)")],
-        [KeyboardButton("📈 Динамика по товару")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-def admin_keyboard():
-    buttons = [
-        [KeyboardButton("➕ Добавить менеджера"), KeyboardButton("➖ Удалить менеджера")],
-        [KeyboardButton("📋 Список менеджеров")],
-        [KeyboardButton("🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
-
-# ---------- ОБРАБОТЧИКИ КОМАНД ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user = update.effective_user
-    if is_admin(chat_id):
-        name = user.first_name if user.first_name else ""
-        greeting = get_greeting(name)
-        await update.message.reply_text(greeting, reply_markup=main_admin_keyboard())
-    elif is_manager(chat_id):
-        manager = get_manager_info(chat_id)
-        name = manager.get("first_name") if manager and manager.get("first_name") else user.first_name or ""
-        greeting = get_greeting(name)
-        await update.message.reply_text(greeting, reply_markup=main_user_keyboard())
-    else:
-        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
-
-async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    chat_id = update.effective_chat.id
-
-    if text == "📊 Отчёт по продажам":
-        if not has_access(chat_id):
-            await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
-            return
-        await update.message.reply_text("Выберите тип отчёта по продажам:", reply_markup=sales_reports_keyboard())
-        return
-
-    if text == "📦 Отчёт по товарам":
-        if not has_access(chat_id):
-            await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
-            return
-        await update.message.reply_text("Выберите тип отчёта по товарам:", reply_markup=products_reports_keyboard())
-        return
-
-    if text == "⚙️ Администрирование":
-        if not is_admin(chat_id):
-            await update.message.reply_text("⛔ Только для администратора.")
-            return
-        await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
-        return
-
-    if text == "📖 Справка":
-        if is_admin(chat_id):
-            help_text = (
-                "📖 *Справка для администратора*\n\n"
-                "🔹 *Основные функции*\n"
-                "• 📊 Отчёт по продажам – актуальная сводка по продажам за сегодня и текущий месяц.\n"
-                "• 📦 Отчёт по товарам – топ товаров по выручке за сегодня и текущий месяц.\n"
-                "• 📆 Выбрать дату – просмотр данных за конкретный день (продажи или товары).\n"
-                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
-                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
-                "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n"
-                "• ⚙️ Администрирование – управление доступом менеджеров.\n\n"
-                "🔹 *Управление менеджерами*\n"
-                "• ➕ Добавить менеджера – введите Telegram ID или @username пользователя, затем номер телефона (или '-' для пропуска).\n"
-                "• ➖ Удалить менеджера – введите Telegram ID пользователя.\n"
-                "• 📋 Список менеджеров – просмотр всех добавленных пользователей (ID, username, имя, телефон).\n\n"
-                "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
-                "🔹 *Метрики*\n"
-                "• 🛒 Заказано – сумма и количество всех заказов.\n"
-                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
-                "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
-                "🔹 *Сравнение динамики*\n"
-                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
-                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
-                "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
-            )
-        else:
-            help_text = (
-                "📖 *Справка для менеджера*\n\n"
-                "🔹 *Основные функции*\n"
-                "• 📊 Отчёт по продажам – актуальная сводка по продажам за сегодня и текущий месяц.\n"
-                "• 📦 Отчёт по товарам – топ товаров по выручке за сегодня и текущий месяц.\n"
-                "• 📆 Выбрать дату – просмотр данных за конкретный день (продажи или товары).\n"
-                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
-                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
-                "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n\n"
-                "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
-                "🔹 *Метрики*\n"
-                "• 🛒 Заказано – сумма и количество всех заказов.\n"
-                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
-                "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
-                "🔹 *Сравнение динамики*\n"
-                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
-                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
-                "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
-            )
-        await update.message.reply_text(help_text, parse_mode="Markdown")
-        return
-
-    await update.message.reply_text("Используйте кнопки меню.")
-
-async def handle_sales_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    chat_id = update.effective_chat.id
-
-    if text == "🔙 Назад":
-        if is_admin(chat_id):
-            await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
-        else:
-            await update.message.reply_text("Главное меню", reply_markup=main_user_keyboard())
-        return
-
-    if not has_access(chat_id):
-        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
-        return
-
-    if text == "📅 Продажи за сегодня":
-        report = format_combined_metrics_with_deltas(include_yesterday=False)
-        await update.message.reply_text(report, parse_mode="Markdown")
-    elif text == "📆 Выбрать дату":
-        now = get_moscow_today()
-        keyboard = create_calendar(now.year, now.month, "date_")
-        await update.message.reply_text("Выберите дату (продажи):", reply_markup=keyboard)
-        return WAITING_DATE_SINGLE
-    elif text == "📊 Выбрать период":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗓️ По месяцам", callback_data="period_month")],
-            [InlineKeyboardButton("📅 По кварталам", callback_data="period_quarter")],
-            [InlineKeyboardButton("📆 По годам", callback_data="period_year")],
-            [InlineKeyboardButton("📊 Произвольный период", callback_data="period_custom")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")]
-        ])
-        await update.message.reply_text("Выберите тип периода:", reply_markup=keyboard)
-        return WAITING_PERIOD_TYPE
-    elif text == "📈 Динамика продаж":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [
-            [InlineKeyboardButton("📅 Текущий год", callback_data="dynamics_current")],
-            [InlineKeyboardButton("📆 Выбрать год", callback_data="dynamics_select")],
-            [InlineKeyboardButton("📊 Диапазон лет", callback_data="dynamics_range")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="dynamics_cancel")]
-        ]
-        await update.message.reply_text(
-            "Выберите вариант для построения графика:\n"
-            "• Текущий год – сразу покажет динамику за текущий год.\n"
-            "• Выбрать год – покажет список годов (последние 10).\n"
-            "• Диапазон лет – введите начальный и конечный год.",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
-        return WAITING_DYNAMICS_SELECT
-    else:
-        await update.message.reply_text("Неизвестная команда.")
-
-async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    chat_id = update.effective_chat.id
-
-    if text == "🔙 Назад":
-        if is_admin(chat_id):
-            await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
-        else:
-            await update.message.reply_text("Главное меню", reply_markup=main_user_keyboard())
-        return
-
-    if not has_access(chat_id):
-        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
-        return
-
-    if text == "📅 Топ товаров за сегодня":
-        report = format_product_combined()
-        await update.message.reply_text(report)
-    elif text == "📆 Выбрать дату (товары)":
-        now = get_moscow_today()
-        keyboard = create_calendar(now.year, now.month, "pdate_")
-        await update.message.reply_text("Выберите дату (товары):", reply_markup=keyboard)
-        return WAITING_PRODUCT_DATE
-    elif text == "📊 Выбрать период (товары)":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🗓️ По месяцам", callback_data="pmonth")],
-            [InlineKeyboardButton("📅 По кварталам", callback_data="pquarter")],
-            [InlineKeyboardButton("📆 По годам", callback_data="pyear")],
-            [InlineKeyboardButton("📊 Произвольный период", callback_data="pcustom")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="pcancel")]
-        ])
-        await update.message.reply_text("Выберите тип периода для товаров:", reply_markup=keyboard)
-        return WAITING_PRODUCT_PERIOD_TYPE
-    elif text == "📈 Динамика по товару":
-        # Показываем список товаров в формате "SKU Наименование Артикул"
-        await update.message.reply_text("⏳ Загружаю список товаров за последние 30 дней...")
-        top_products = get_top_products_for_select(days=30)
-        if not top_products:
-            await update.message.reply_text("❌ Нет данных о товарах за последние 30 дней.")
-            return ConversationHandler.END
-        # Сохраняем список в user_data
-        context.user_data['product_list'] = top_products
-        # Формируем inline-кнопки
-        keyboard = []
-        for idx, (sku, stats) in enumerate(top_products, 1):
-            name = stats['name'][:30]  # обрезаем для кнопки
-            offer_id = stats.get('offer_id', '')
-            if offer_id:
-                text = f"{idx}. SKU:{sku} {name} (Арт:{offer_id})"
-            else:
-                text = f"{idx}. SKU:{sku} {name}"
-            keyboard.append([InlineKeyboardButton(text, callback_data=f"prod_{sku}")])
-        # Добавляем кнопку ручного ввода
-        keyboard.append([InlineKeyboardButton("✏️ Ввести SKU вручную", callback_data="prod_manual")])
-        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="prod_cancel")])
-        await update.message.reply_text(
-            "Выберите товар, нажав на соответствующую кнопку, или введите SKU вручную:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return WAITING_PRODUCT_SELECT
-    else:
-        await update.message.reply_text("Неизвестная команда.")
-
-async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return
-    text = update.message.text
-
-    if text == "📋 Список менеджеров":
-        managers = load_managers()
-        if not managers:
-            await update.message.reply_text("Список менеджеров пуст.")
-        else:
-            lines = ["📋 Список менеджеров:"]
-            for m in managers:
-                info = f"ID: {m.get('id')}"
-                if m.get('username'):
-                    info += f", @{m.get('username')}"
-                if m.get('first_name'):
-                    info += f", {m.get('first_name')}"
-                if m.get('phone'):
-                    info += f", 📞 {m.get('phone')}"
-                lines.append(info)
-            await update.message.reply_text("\n".join(lines))
-    elif text == "🔙 Назад":
-        await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
-    else:
-        await update.message.reply_text("Неизвестная команда.")
-
-# ---------- ДИАЛОГИ АДМИНИСТРИРОВАНИЯ ----------
-async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите ID (число) или username (без @):")
-    return WAITING_ADD_MANAGER
-
-async def add_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return ConversationHandler.END
-    text = update.message.text.strip()
-    if not text:
-        await update.message.reply_text("❌ Введите ID или username.")
-        return WAITING_ADD_MANAGER
-    if text.isdigit():
-        user_id = int(text)
-        try:
-            user = await context.bot.get_chat(user_id)
-            username = user.username or ""
-            first_name = user.first_name or ""
-            last_name = user.last_name or ""
-        except Exception:
-            await update.message.reply_text(f"❌ Не удалось найти пользователя с ID {user_id}. Убедитесь, что он уже написал боту.")
-            return WAITING_ADD_MANAGER
-    else:
-        username = text.lstrip('@')
-        try:
-            user = await context.bot.get_chat(username)
-            user_id = user.id
-            first_name = user.first_name or ""
-            last_name = user.last_name or ""
-        except Exception:
-            await update.message.reply_text(f"❌ Не удалось найти пользователя @{username}. Убедитесь, что он уже написал боту.")
-            return WAITING_ADD_MANAGER
-    if user_id == ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Администратор уже имеет доступ.")
-        return WAITING_ADD_MANAGER
-    context.user_data['new_manager'] = {
-        'id': user_id,
-        'username': username,
-        'first_name': first_name,
-        'last_name': last_name
-    }
-    await update.message.reply_text("Введите номер телефона менеджера (или '-' чтобы пропустить):")
-    return WAITING_MANAGER_PHONE
-
-async def add_manager_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return ConversationHandler.END
-    phone = update.message.text.strip()
-    if phone == "-":
-        phone = ""
-    data = context.user_data.get('new_manager')
-    if not data:
-        await update.message.reply_text("❌ Ошибка: данные менеджера потеряны. Начните заново.")
-        return ConversationHandler.END
-    user_id = data['id']; username = data['username']; first_name = data['first_name']; last_name = data['last_name']
-    if add_manager(user_id, username, first_name, last_name, phone):
-        await update.message.reply_text(f"✅ Менеджер с ID {user_id} (username: @{username}) добавлен.")
-    else:
-        await update.message.reply_text(f"⚠️ Менеджер с ID {user_id} уже существует.")
-    context.user_data.pop('new_manager', None)
-    await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
-    return ConversationHandler.END
-
-async def remove_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введите ID менеджера (цифры):")
-    return WAITING_REMOVE_MANAGER
-
-async def remove_manager_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_admin(chat_id):
-        await update.message.reply_text("⛔ Только для администратора.")
-        return ConversationHandler.END
-    try:
-        user_id = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ Введите число.")
-        return WAITING_REMOVE_MANAGER
-    if user_id == ADMIN_CHAT_ID:
-        await update.message.reply_text("❌ Администратора нельзя удалить.")
-        return WAITING_REMOVE_MANAGER
-    if remove_manager(user_id):
-        await update.message.reply_text(f"✅ Менеджер с ID {user_id} удалён.")
-    else:
-        await update.message.reply_text(f"❌ Менеджер с ID {user_id} не найден.")
-    await update.message.reply_text("Управление менеджерами:", reply_markup=admin_keyboard())
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if is_admin(chat_id):
-        keyboard = main_admin_keyboard()
-    else:
-        keyboard = main_user_keyboard()
-    await update.message.reply_text("Действие отменено.", reply_markup=keyboard)
-    return ConversationHandler.END
-
-# ---------- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ РУЧНОГО ВВОДА SKU ----------
-async def product_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Введите SKU товара (числовой идентификатор):")
-    return WAITING_PRODUCT_SKU_MANUAL
-
-async def product_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ SKU должен быть числом. Попробуйте снова или отмените командой /cancel.")
-        return WAITING_PRODUCT_SKU_MANUAL
-    sku = text
-    # Проверим, есть ли такой товар в сохранённом списке
-    product_list = context.user_data.get('product_list', [])
-    product_name = "Товар"
-    for p_sku, stats in product_list:
-        if p_sku == sku:
-            product_name = stats['name'][:40]
-            break
-    context.user_data['product_sku'] = sku
-    context.user_data['product_name'] = product_name
-
-    # Предлагаем выбрать метрику
     keyboard = [
-        [InlineKeyboardButton("Заказано (₽)", callback_data="metric_ordered_sum")],
-        [InlineKeyboardButton("Заказано (шт.)", callback_data="metric_ordered_units")],
-        [InlineKeyboardButton("Доставлено (₽)", callback_data="metric_delivered_sum")],
-        [InlineKeyboardButton("Доставлено (шт.)", callback_data="metric_delivered_units")],
-        [InlineKeyboardButton("Отменено (₽)", callback_data="metric_canceled_sum")],
-        [InlineKeyboardButton("Отменено (шт.)", callback_data="metric_canceled_units")],
-        [InlineKeyboardButton("Средний чек (₽)", callback_data="metric_avg_check")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="metric_cancel")]
+        [KeyboardButton("📊 Метрики за день"), KeyboardButton("📈 Метрики за период")],
+        [KeyboardButton("📅 Месяц"), KeyboardButton("🗓️ Квартал")],
+        [KeyboardButton("📆 Год"), KeyboardButton("📉 Динамика продаж")],
+        [KeyboardButton("🏆 Топ товары"), KeyboardButton("ℹ️ Помощь")]
     ]
-    await update.message.reply_text(
-        f"Выбран товар: {product_name} (SKU: {sku})\nТеперь выберите метрику для графика:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return WAITING_PRODUCT_METRIC
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-# ---------- ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
-async def product_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "prod_cancel":
-        await query.edit_message_text("Выбор товара отменён.")
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data == "prod_manual":
-        await query.edit_message_text("Введите SKU товара (числовой идентификатор):")
-        return WAITING_PRODUCT_SKU_MANUAL
-
-    if data.startswith("prod_"):
-        sku = data[5:]  # убираем "prod_"
-        context.user_data['product_sku'] = sku
-        # Найдём имя товара
-        product_list = context.user_data.get('product_list', [])
-        product_name = "Товар"
-        for p_sku, stats in product_list:
-            if p_sku == sku:
-                product_name = stats['name'][:40]
-                break
-        context.user_data['product_name'] = product_name
-
-        # Предлагаем выбрать метрику
-        keyboard = [
-            [InlineKeyboardButton("Заказано (₽)", callback_data="metric_ordered_sum")],
-            [InlineKeyboardButton("Заказано (шт.)", callback_data="metric_ordered_units")],
-            [InlineKeyboardButton("Доставлено (₽)", callback_data="metric_delivered_sum")],
-            [InlineKeyboardButton("Доставлено (шт.)", callback_data="metric_delivered_units")],
-            [InlineKeyboardButton("Отменено (₽)", callback_data="metric_canceled_sum")],
-            [InlineKeyboardButton("Отменено (шт.)", callback_data="metric_canceled_units")],
-            [InlineKeyboardButton("Средний чек (₽)", callback_data="metric_avg_check")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="metric_cancel")]
-        ]
-        await query.edit_message_text(
-            f"Выбран товар: {product_name} (SKU: {sku})\nТеперь выберите метрику для графика:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return WAITING_PRODUCT_METRIC
-
-async def product_metric_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "metric_cancel":
-        await query.edit_message_text("Выбор метрики отменён.")
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("metric_"):
-        metric = data[7:]  # убираем "metric_"
-        context.user_data['product_metric'] = metric
-
-        # Предлагаем выбрать период
-        current_year = get_moscow_today().year
-        keyboard = [
-            [InlineKeyboardButton("📅 Текущий год", callback_data="period_current")],
-            [InlineKeyboardButton("📆 Выбрать год", callback_data="period_select_year")],
-            [InlineKeyboardButton("📊 Диапазон лет", callback_data="period_range")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")]
-        ]
-        await query.edit_message_text(
-            "Выберите период для построения графика:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return WAITING_PRODUCT_PERIOD_CHOICE
-
-async def product_period_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "period_cancel":
-        await query.edit_message_text("Построение графика отменено.")
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data == "period_current":
-        # Текущий год
-        current_year = get_moscow_today().year
-        sku = context.user_data.get('product_sku')
-        metric = context.user_data.get('product_metric')
-        if not sku or not metric:
-            await query.edit_message_text("❌ Ошибка: потеряны данные. Начните заново.")
-            return ConversationHandler.END
-        await query.edit_message_text(f"⏳ Строю график для {context.user_data.get('product_name', 'товара')} (текущий год)...")
-        chart_buf = generate_product_chart_by_metric(sku, metric, [current_year])
-        if chart_buf:
-            await query.message.reply_photo(photo=chart_buf, caption=f"Динамика по товару (SKU: {sku}) за {current_year} год")
-        else:
-            await query.message.reply_text("❌ Нет данных для построения графика.")
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        context.user_data.pop('product_sku', None)
-        context.user_data.pop('product_metric', None)
-        context.user_data.pop('product_name', None)
-        return ConversationHandler.END
-
-    elif data == "period_select_year":
-        # Выбрать год из списка
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"year_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
-        await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PRODUCT_SINGLE_YEAR
-
-    elif data == "period_range":
-        await query.edit_message_text("Введите начальный год (например, 2020):")
-        return WAITING_PRODUCT_RANGE_START
-
-async def product_year_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "period_cancel":
-        await query.edit_message_text("Построение графика отменено.")
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("year_"):
-        year = int(data[5:])
-        sku = context.user_data.get('product_sku')
-        metric = context.user_data.get('product_metric')
-        if not sku or not metric:
-            await query.edit_message_text("❌ Ошибка: потеряны данные. Начните заново.")
-            return ConversationHandler.END
-        await query.edit_message_text(f"⏳ Строю график для {context.user_data.get('product_name', 'товара')} за {year} год...")
-        chart_buf = generate_product_chart_by_metric(sku, metric, [year])
-        if chart_buf:
-            await query.message.reply_photo(photo=chart_buf, caption=f"Динамика по товару (SKU: {sku}) за {year} год")
-        else:
-            await query.message.reply_text("❌ Нет данных для построения графика.")
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        context.user_data.pop('product_sku', None)
-        context.user_data.pop('product_metric', None)
-        context.user_data.pop('product_name', None)
-        return ConversationHandler.END
-
-async def product_range_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ Пожалуйста, введите число (год).")
-        return WAITING_PRODUCT_RANGE_START
-    year = int(text)
-    if year < 2000 or year > get_moscow_today().year + 1:
-        await update.message.reply_text("❌ Некорректный год. Введите год от 2000 до текущего.")
-        return WAITING_PRODUCT_RANGE_START
-    context.user_data['product_range_start'] = year
-    await update.message.reply_text("Введите конечный год (включительно):")
-    return WAITING_PRODUCT_RANGE_END
-
-async def product_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ Пожалуйста, введите число (год).")
-        return WAITING_PRODUCT_RANGE_END
-    year_end = int(text)
-    year_start = context.user_data.get('product_range_start')
-    if year_start is None:
-        await update.message.reply_text("❌ Ошибка: начальный год не найден. Начните заново.")
-        return ConversationHandler.END
-    if year_end < year_start:
-        await update.message.reply_text("❌ Конечный год должен быть не меньше начального.")
-        return WAITING_PRODUCT_RANGE_END
-    years = list(range(year_start, year_end + 1))
-    if len(years) > 10:
-        await update.message.reply_text("⚠️ Слишком много лет (максимум 10). Пожалуйста, выберите меньший диапазон.")
-        return ConversationHandler.END
-
-    sku = context.user_data.get('product_sku')
-    metric = context.user_data.get('product_metric')
-    if not sku or not metric:
-        await update.message.reply_text("❌ Ошибка: потеряны данные. Начните заново.")
-        return ConversationHandler.END
-    await update.message.reply_text(f"⏳ Строю график для {context.user_data.get('product_name', 'товара')} за {year_start}-{year_end} гг...")
-    chart_buf = generate_product_chart_by_metric(sku, metric, years)
-    if chart_buf:
-        caption = f"Динамика по товару (SKU: {sku}) за {year_start}-{year_end} гг."
-        await update.message.reply_photo(photo=chart_buf, caption=caption)
-    else:
-        await update.message.reply_text("❌ Нет данных для построения графика.")
-    await update.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-    context.user_data.pop('product_sku', None)
-    context.user_data.pop('product_metric', None)
-    context.user_data.pop('product_name', None)
-    context.user_data.pop('product_range_start', None)
-    return ConversationHandler.END
-
-# ---------- INLINE CALLBACK для продаж ----------
-async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     chat_id = update.effective_chat.id
-
+    
     if not has_access(chat_id):
-        await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
+        await update.message.reply_text(
+            "⛔ У вас нет доступа к этому боту.\n"
+            "Пожалуйста, свяжитесь с администратором для получения доступа."
+        )
         return ConversationHandler.END
-
-    # Обработка выбора даты (продажи)
-    if data.startswith("date_"):
-        if data == "date_cancel":
-            await query.edit_message_text("Выбор даты отменён.")
-            await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-            return ConversationHandler.END
-        if "prev_month" in data or "next_month" in data:
-            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
-            if match:
-                if match.group(1) and match.group(2):
-                    year = int(match.group(1)); month = int(match.group(2)); action = "prev_month"
-                else:
-                    year = int(match.group(3)); month = int(match.group(4)); action = "next_month"
-            else:
-                await query.edit_message_text("❌ Ошибка формата навигации.")
-                return WAITING_DATE_SINGLE
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month = 12; year -= 1
-            else:
-                month += 1
-                if month == 13: month = 1; year += 1
-            keyboard = create_calendar(year, month, "date_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_DATE_SINGLE
-        date_str = data[5:]
-        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
-            # Валидация даты
-            valid, result = validate_date(date_str)
-            if not valid:
-                await query.edit_message_text(result)
-                return WAITING_DATE_SINGLE
-            metrics = get_metrics_for_date(date_str)
-            msg = format_single_metrics(metrics, f"Продажи за {date_str}")
-            await query.edit_message_text(msg, parse_mode="Markdown")
-            await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-            return ConversationHandler.END
-        else:
-            await query.edit_message_text("❌ Ошибка формата даты.")
-            return WAITING_DATE_SINGLE
-
-    # Обработка выбора периода (продажи)
-    if data == "period_month":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_month_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
-        await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PERIOD_YEAR
-    if data == "period_quarter":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_quarter_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
-        await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PERIOD_YEAR
-    if data == "period_year":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_only_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
-        await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_YEAR_SELECT
-    if data == "period_custom":
-        now = get_moscow_today()
-        keyboard = create_calendar(now.year, now.month, "start_")
-        await query.edit_message_text("Выберите начальную дату:", reply_markup=keyboard)
-        return WAITING_PERIOD_START
-    if data == "period_cancel":
-        await query.edit_message_text("Выбор периода отменён.")
-        await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("period_year_month_"):
-        year = int(data.split("_")[-1])
-        context.user_data['period_year'] = year
-        months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
-        buttons = [[InlineKeyboardButton(name, callback_data=f"period_month_{i}_{year}")] for i, name in enumerate(months, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
-        await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PERIOD_MONTH
-    if data.startswith("period_year_quarter_"):
-        year = int(data.split("_")[-1])
-        context.user_data['period_year'] = year
-        quarters = ["1 квартал (янв-мар)", "2 квартал (апр-июн)", "3 квартал (июл-сен)", "4 квартал (окт-дек)"]
-        buttons = [[InlineKeyboardButton(name, callback_data=f"period_quarter_{i}_{year}")] for i, name in enumerate(quarters, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
-        await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PERIOD_QUARTER
-
-    if data.startswith("period_year_only_"):
-        year = int(data.split("_")[-1])
-        first_day = datetime.date(year, 1, 1)
-        last_day = datetime.date(year, 12, 31)
-        metrics = get_metrics_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
-        msg = format_single_metrics(metrics, f"Продажи за {year} год")
-        await query.edit_message_text(msg, parse_mode="Markdown")
-        await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("period_month_"):
-        parts = data.split("_")
-        month_num, year = int(parts[2]), int(parts[3])
-        first_day = datetime.date(year, month_num, 1)
-        if month_num == 12:
-            last_day = datetime.date(year, 12, 31)
-        else:
-            last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
-        date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        metrics = get_metrics_for_period(date_from, date_to)
-        msg = format_single_metrics(metrics, f"Продажи за {first_day.strftime('%B %Y')}")
-        await query.edit_message_text(msg, parse_mode="Markdown")
-        await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("period_quarter_"):
-        parts = data.split("_")
-        q, year = int(parts[2]), int(parts[3])
-        start_month = (q-1)*3 + 1
-        end_month = q*3
-        first_day = datetime.date(year, start_month, 1)
-        if end_month == 12:
-            last_day = datetime.date(year, 12, 31)
-        else:
-            last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
-        date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        metrics = get_metrics_for_period(date_from, date_to)
-        msg = format_single_metrics(metrics, f"Продажи за {q} квартал {year}")
-        await query.edit_message_text(msg, parse_mode="Markdown")
-        await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("start_"):
-        if data == "start_cancel":
-            await query.edit_message_text("Выбор периода отменён.")
-            await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-            return ConversationHandler.END
-        if "prev_month" in data or "next_month" in data:
-            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
-            if match:
-                if match.group(1) and match.group(2):
-                    year = int(match.group(1)); month = int(match.group(2)); action = "prev_month"
-                else:
-                    year = int(match.group(3)); month = int(match.group(4)); action = "next_month"
-            else:
-                await query.edit_message_text("❌ Ошибка формата навигации.")
-                return WAITING_PERIOD_START
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month = 12; year -= 1
-            else:
-                month += 1
-                if month == 13: month = 1; year += 1
-            keyboard = create_calendar(year, month, "start_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_PERIOD_START
-        date_str = data[6:]
-        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
-            valid, result = validate_date(date_str)
-            if not valid:
-                await query.edit_message_text(result)
-                return WAITING_PERIOD_START
-            context.user_data['period_start_date'] = date_str
-            now = get_moscow_today()
-            keyboard = create_calendar(now.year, now.month, "end_")
-            await query.edit_message_text(f"Начало: {date_str}\nТеперь выберите конечную дату:", reply_markup=keyboard)
-            return WAITING_PERIOD_END
-        else:
-            await query.edit_message_text("❌ Ошибка формата даты.")
-            return WAITING_PERIOD_START
-
-    if data.startswith("end_"):
-        if data == "end_cancel":
-            await query.edit_message_text("Выбор периода отменён.")
-            await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-            return ConversationHandler.END
-        if "prev_month" in data or "next_month" in data:
-            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
-            if match:
-                if match.group(1) and match.group(2):
-                    year = int(match.group(1)); month = int(match.group(2)); action = "prev_month"
-                else:
-                    year = int(match.group(3)); month = int(match.group(4)); action = "next_month"
-            else:
-                await query.edit_message_text("❌ Ошибка формата навигации.")
-                return WAITING_PERIOD_END
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month = 12; year -= 1
-            else:
-                month += 1
-                if month == 13: month = 1; year += 1
-            keyboard = create_calendar(year, month, "end_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_PERIOD_END
-        end_date_str = data[4:]
-        if re.match(r"\d{4}-\d{2}-\d{2}", end_date_str):
-            valid, result = validate_date(end_date_str)
-            if not valid:
-                await query.edit_message_text(result)
-                return WAITING_PERIOD_END
-            start_date = context.user_data.get('period_start_date')
-            if not start_date:
-                await query.edit_message_text("❌ Ошибка: начальная дата не найдена. Попробуйте снова.")
-                return ConversationHandler.END
-            # Валидация периода
-            valid_period, msg = validate_period(start_date, end_date_str)
-            if not valid_period:
-                await query.edit_message_text(msg)
-                now = get_moscow_today()
-                keyboard = create_calendar(now.year, now.month, "start_")
-                await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
-                return WAITING_PERIOD_START
-            metrics = get_metrics_for_period(start_date, end_date_str)
-            msg = format_single_metrics(metrics, f"Продажи за период {start_date} – {end_date_str}")
-            await query.edit_message_text(msg, parse_mode="Markdown")
-            await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-            context.user_data.pop('period_start_date', None)
-            return ConversationHandler.END
-        else:
-            await query.edit_message_text("❌ Ошибка формата даты.")
-            return WAITING_PERIOD_END
-
-    # Динамика продаж (график)
-    if data == "dynamics_current":
-        await query.edit_message_text("⏳ Загружаю данные для текущего года...")
-        current_year = get_moscow_today().year
-        chart_buf = generate_sales_chart([current_year])
-        if chart_buf:
-            await query.message.reply_photo(photo=chart_buf, caption=f"Динамика доставленных заказов за {current_year} год")
-        else:
-            await query.message.reply_text("❌ Не удалось построить график.")
-        await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-        return ConversationHandler.END
-
-    if data == "dynamics_select":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"dynamics_year_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="dynamics_cancel")])
-        await query.edit_message_text("Выберите год для отображения графика:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_DYNAMICS_SELECT
-
-    if data == "dynamics_range":
-        await query.edit_message_text("Введите начальный год (например, 2020):")
-        return WAITING_DYNAMICS_RANGE_START
-
-    if data == "dynamics_cancel":
-        await query.edit_message_text("Построение графика отменено.")
-        await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("dynamics_year_"):
-        year = int(data.split("_")[-1])
-        await query.edit_message_text(f"⏳ Загружаю данные за {year} год...")
-        chart_buf = generate_sales_chart([year])
-        if chart_buf:
-            await query.message.reply_photo(photo=chart_buf, caption=f"Динамика доставленных заказов за {year} год")
-        else:
-            await query.message.reply_text("❌ Не удалось построить график.")
-        await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-        return ConversationHandler.END
-
-    # ---------- ТОВАРНЫЕ ОТЧЁТЫ (inline) – без Markdown ----------
-    if data.startswith("pdate_"):
-        if data == "pdate_cancel":
-            await query.edit_message_text("Выбор даты отменён.")
-            await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-            return ConversationHandler.END
-        if "prev_month" in data or "next_month" in data:
-            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
-            if match:
-                if match.group(1) and match.group(2):
-                    year = int(match.group(1)); month = int(match.group(2)); action = "prev_month"
-                else:
-                    year = int(match.group(3)); month = int(match.group(4)); action = "next_month"
-            else:
-                await query.edit_message_text("❌ Ошибка формата навигации.")
-                return WAITING_PRODUCT_DATE
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month = 12; year -= 1
-            else:
-                month += 1
-                if month == 13: month = 1; year += 1
-            keyboard = create_calendar(year, month, "pdate_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_PRODUCT_DATE
-        date_str = data[6:]
-        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
-            # Валидация даты
-            valid, result = validate_date(date_str)
-            if not valid:
-                await query.edit_message_text(result)
-                return WAITING_PRODUCT_DATE
-            products = get_product_data_for_date(date_str)
-            msg = format_top_products(products, f"Товары за {date_str}", limit=20)
-            summary = format_products_summary(products)
-            await query.edit_message_text(msg + "\n\n" + summary)
-            await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-            return ConversationHandler.END
-        else:
-            await query.edit_message_text("❌ Ошибка формата даты.")
-            return WAITING_PRODUCT_DATE
-
-    # Периоды товаров
-    if data == "pmonth":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"pyear_month_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
-        await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PRODUCT_YEAR
-    if data == "pquarter":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"pyear_quarter_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
-        await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PRODUCT_YEAR
-    if data == "pyear":
-        current_year = get_moscow_today().year
-        years = list(range(current_year - 9, current_year + 1))
-        buttons = [[InlineKeyboardButton(str(y), callback_data=f"pyear_only_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
-        await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PRODUCT_YEAR_SELECT
-    if data == "pcustom":
-        now = get_moscow_today()
-        keyboard = create_calendar(now.year, now.month, "pstart_")
-        await query.edit_message_text("Выберите начальную дату:", reply_markup=keyboard)
-        return WAITING_PRODUCT_PERIOD_START
-    if data == "pcancel":
-        await query.edit_message_text("Выбор периода отменён.")
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("pyear_month_"):
-        year = int(data.split("_")[-1])
-        context.user_data['p_year'] = year
-        months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-                  "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
-        buttons = [[InlineKeyboardButton(name, callback_data=f"pmonth_{i}_{year}")] for i, name in enumerate(months, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
-        await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PRODUCT_MONTH
-    if data.startswith("pyear_quarter_"):
-        year = int(data.split("_")[-1])
-        context.user_data['p_year'] = year
-        quarters = ["1 квартал (янв-мар)", "2 квартал (апр-июн)", "3 квартал (июл-сен)", "4 квартал (окт-дек)"]
-        buttons = [[InlineKeyboardButton(name, callback_data=f"pquarter_{i}_{year}")] for i, name in enumerate(quarters, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
-        await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
-        return WAITING_PRODUCT_QUARTER
-
-    if data.startswith("pyear_only_"):
-        year = int(data.split("_")[-1])
-        first_day = datetime.date(year, 1, 1)
-        last_day = datetime.date(year, 12, 31)
-        products = get_product_data_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
-        msg = format_top_products(products, f"Товары за {year} год", limit=20)
-        summary = format_products_summary(products)
-        await query.edit_message_text(msg + "\n\n" + summary)
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("pmonth_"):
-        parts = data.split("_")
-        month_num, year = int(parts[1]), int(parts[2])
-        first_day = datetime.date(year, month_num, 1)
-        if month_num == 12:
-            last_day = datetime.date(year, 12, 31)
-        else:
-            last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
-        date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        products = get_product_data_for_period(date_from, date_to)
-        msg = format_top_products(products, f"Товары за {first_day.strftime('%B %Y')}", limit=20)
-        summary = format_products_summary(products)
-        await query.edit_message_text(msg + "\n\n" + summary)
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("pquarter_"):
-        parts = data.split("_")
-        q, year = int(parts[1]), int(parts[2])
-        start_month = (q-1)*3 + 1
-        end_month = q*3
-        first_day = datetime.date(year, start_month, 1)
-        if end_month == 12:
-            last_day = datetime.date(year, 12, 31)
-        else:
-            last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
-        date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        products = get_product_data_for_period(date_from, date_to)
-        msg = format_top_products(products, f"Товары за {q} квартал {year}", limit=20)
-        summary = format_products_summary(products)
-        await query.edit_message_text(msg + "\n\n" + summary)
-        await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-        return ConversationHandler.END
-
-    if data.startswith("pstart_"):
-        if data == "pstart_cancel":
-            await query.edit_message_text("Выбор периода отменён.")
-            await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-            return ConversationHandler.END
-        if "prev_month" in data or "next_month" in data:
-            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
-            if match:
-                if match.group(1) and match.group(2):
-                    year = int(match.group(1)); month = int(match.group(2)); action = "prev_month"
-                else:
-                    year = int(match.group(3)); month = int(match.group(4)); action = "next_month"
-            else:
-                await query.edit_message_text("❌ Ошибка формата навигации.")
-                return WAITING_PRODUCT_PERIOD_START
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month = 12; year -= 1
-            else:
-                month += 1
-                if month == 13: month = 1; year += 1
-            keyboard = create_calendar(year, month, "pstart_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_PRODUCT_PERIOD_START
-        date_str = data[7:]
-        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
-            valid, result = validate_date(date_str)
-            if not valid:
-                await query.edit_message_text(result)
-                return WAITING_PRODUCT_PERIOD_START
-            context.user_data['p_start_date'] = date_str
-            now = get_moscow_today()
-            keyboard = create_calendar(now.year, now.month, "pend_")
-            await query.edit_message_text(f"Начало: {date_str}\nТеперь выберите конечную дату:", reply_markup=keyboard)
-            return WAITING_PRODUCT_PERIOD_END
-        else:
-            await query.edit_message_text("❌ Ошибка формата даты.")
-            return WAITING_PRODUCT_PERIOD_START
-
-    if data.startswith("pend_"):
-        if data == "pend_cancel":
-            await query.edit_message_text("Выбор периода отменён.")
-            await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-            return ConversationHandler.END
-        if "prev_month" in data or "next_month" in data:
-            match = re.search(r'prev_month_(\d+)_(\d+)|next_month_(\d+)_(\d+)', data)
-            if match:
-                if match.group(1) and match.group(2):
-                    year = int(match.group(1)); month = int(match.group(2)); action = "prev_month"
-                else:
-                    year = int(match.group(3)); month = int(match.group(4)); action = "next_month"
-            else:
-                await query.edit_message_text("❌ Ошибка формата навигации.")
-                return WAITING_PRODUCT_PERIOD_END
-            if action == "prev_month":
-                month -= 1
-                if month == 0: month = 12; year -= 1
-            else:
-                month += 1
-                if month == 13: month = 1; year += 1
-            keyboard = create_calendar(year, month, "pend_")
-            await query.edit_message_reply_markup(reply_markup=keyboard)
-            return WAITING_PRODUCT_PERIOD_END
-        end_date_str = data[5:]
-        if re.match(r"\d{4}-\d{2}-\d{2}", end_date_str):
-            valid, result = validate_date(end_date_str)
-            if not valid:
-                await query.edit_message_text(result)
-                return WAITING_PRODUCT_PERIOD_END
-            start_date = context.user_data.get('p_start_date')
-            if not start_date:
-                await query.edit_message_text("❌ Ошибка: начальная дата не найдена. Попробуйте снова.")
-                return ConversationHandler.END
-            # Валидация периода
-            valid_period, msg = validate_period(start_date, end_date_str)
-            if not valid_period:
-                await query.edit_message_text(msg)
-                now = get_moscow_today()
-                keyboard = create_calendar(now.year, now.month, "pstart_")
-                await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
-                return WAITING_PRODUCT_PERIOD_START
-            products = get_product_data_for_period(start_date, end_date_str)
-            msg = format_top_products(products, f"Товары за период {start_date} – {end_date_str}", limit=20)
-            summary = format_products_summary(products)
-            await query.edit_message_text(msg + "\n\n" + summary)
-            await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
-            context.user_data.pop('p_start_date', None)
-            return ConversationHandler.END
-        else:
-            await query.edit_message_text("❌ Ошибка формата даты.")
-            return WAITING_PRODUCT_PERIOD_END
-
-    # ---------- НОВЫЕ ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
-    if data.startswith("prod_"):
-        return await product_select_callback(update, context)
-    if data == "prod_manual":
-        return await product_manual_callback(update, context)
-    if data.startswith("metric_"):
-        return await product_metric_callback(update, context)
-    if data.startswith("period_") or data.startswith("year_") or data == "period_cancel" or data == "period_current" or data == "period_select_year" or data == "period_range":
-        return await product_period_callback(update, context)
-
-    await query.edit_message_text("❌ Неизвестная команда.")
+    
+    name = user.first_name if user.first_name else "пользователь"
+    greeting = get_greeting(name)
+    
+    keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+    
+    await update.message.reply_text(
+        f"{greeting}\n\n"
+        "Выберите действие из меню:",
+        reply_markup=keyboard
+    )
     return ConversationHandler.END
 
-# ---------- ДИАЛОГ ДИНАМИКИ ПРОДАЖ (диапазон) ----------
-async def dynamics_range_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ Пожалуйста, введите число (год).")
-        return WAITING_DYNAMICS_RANGE_START
-    year = int(text)
-    if year < 2000 or year > get_moscow_today().year + 1:
-        await update.message.reply_text("❌ Некорректный год. Введите год от 2000 до текущего.")
-        return WAITING_DYNAMICS_RANGE_START
-    context.user_data['dynamics_range_start'] = year
-    await update.message.reply_text("Введите конечный год (включительно):")
-    return WAITING_DYNAMICS_RANGE_END
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "<b>📖 Справка по командам бота</b>\n\n"
+        "<b>Основные функции:</b>\n"
+        "• <b>📊 Метрики за день</b> – показывает метрики продаж за выбранную дату\n"
+        "• <b>📈 Метрики за период</b> – метрики за произвольный период\n"
+        "• <b>📅 Месяц</b> – метрики за выбранный месяц\n"
+        "• <b>🗓️ Квартал</b> – метрики за квартал\n"
+        "• <b>📆 Год</b> – метрики за год\n"
+        "• <b>📉 Динамика продаж</b> – график продаж по месяцам\n"
+        "• <b>🏆 Топ товары</b> – топ-10 самых продаваемых товаров\n\n"
+        "<b>Что показывает бот:</b>\n"
+        "• Заказано и доставлено товаров (штуки и сумма)\n"
+        "• Расходы на рекламу\n"
+        "• ДРР (общий) и ДРР (по доставленным)\n"
+        "• Детализация расходов (комиссии, логистика и др.)\n\n"
+        "<i>Все данные берутся из Ozon API в реальном времени.</i>"
+    )
+    
+    if is_admin(update.effective_chat.id):
+        help_text += "\n\n<b>Команды администратора:</b>\n"
+        help_text += "• <b>👥 Управление менеджерами</b> – добавление/удаление менеджеров\n"
+    
+    await update.message.reply_text(help_text, parse_mode='HTML')
 
-async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ Пожалуйста, введите число (год).")
-        return WAITING_DYNAMICS_RANGE_END
-    year_end = int(text)
-    year_start = context.user_data.get('dynamics_range_start')
-    if year_start is None:
-        await update.message.reply_text("❌ Ошибка: начальный год не найден. Начните заново.")
+# ==================== ОБРАБОТЧИК ТОП ТОВАРОВ ====================
+async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало диалога для топ товаров"""
+    keyboard = [
+        [KeyboardButton("📅 Месяц"), KeyboardButton("🗓️ Квартал")],
+        [KeyboardButton("📆 Год"), KeyboardButton("📈 Период")],
+        [KeyboardButton("❌ Отмена")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    
+    await update.message.reply_text(
+        "🏆 <b>Топ товары</b>\n\n"
+        "Выберите период для анализа:",
+        reply_markup=reply_markup,
+        parse_mode='HTML'
+    )
+    return WAITING_TOP_PERIOD_TYPE
+
+async def top_products_period_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора типа периода для топ товаров"""
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    if text == "❌ Отмена":
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text("Отменено.", reply_markup=keyboard)
         return ConversationHandler.END
-    if year_end < year_start:
-        await update.message.reply_text("❌ Конечный год должен быть не меньше начального.")
-        return WAITING_DYNAMICS_RANGE_END
-    years = list(range(year_start, year_end + 1))
-    if len(years) > 10:
-        await update.message.reply_text("⚠️ Слишком много лет (максимум 10). Пожалуйста, выберите меньший диапазон.")
-        return ConversationHandler.END
-    await update.message.reply_text(f"⏳ Загружаю данные за годы {year_start}-{year_end}...")
-    chart_buf = generate_sales_chart(years)
-    if chart_buf:
-        caption = f"Динамика доставленных заказов за {year_start}-{year_end} гг."
-        await update.message.reply_photo(photo=chart_buf, caption=caption)
-    else:
-        await update.message.reply_text("❌ Не удалось построить график.")
-    await update.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
-    context.user_data.pop('dynamics_range_start', None)
+    
+    if text == "📅 Месяц":
+        today = get_moscow_today()
+        keyboard = []
+        for i in range(12):
+            month_date = today.replace(day=1) - datetime.timedelta(days=i*30)
+            month_name = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+                         "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"][month_date.month - 1]
+            keyboard.append([KeyboardButton(f"{month_name} {month_date.year}")])
+        keyboard.append([KeyboardButton("❌ Отмена")])
+        
+        await update.message.reply_text(
+            "Выберите месяц:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        )
+        return WAITING_TOP_MONTH
+    
+    elif text == "🗓️ Квартал":
+        today = get_moscow_today()
+        keyboard = []
+        for i in range(8):
+            year = today.year - i // 4
+            quarter = ((today.month - 1) // 3 + 1 - i % 4) % 4
+            if quarter == 0:
+                quarter = 4
+                year -= 1
+            keyboard.append([KeyboardButton(f"Q{quarter} {year}")])
+        keyboard.append([KeyboardButton("❌ Отмена")])
+        
+        await update.message.reply_text(
+            "Выберите квартал:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        )
+        return WAITING_TOP_QUARTER
+    
+    elif text == "📆 Год":
+        today = get_moscow_today()
+        keyboard = [[KeyboardButton(str(today.year - i))] for i in range(5)]
+        keyboard.append([KeyboardButton("❌ Отмена")])
+        
+        await update.message.reply_text(
+            "Выберите год:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        )
+        return WAITING_TOP_YEAR
+    
+    elif text == "📈 Период":
+        await update.message.reply_text(
+            "Введите начальную дату периода в формате ГГГГ-ММ-ДД\n"
+            "Например: 2024-01-01\n\n"
+            "Или отправьте /cancel для отмены",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return WAITING_TOP_RANGE_START
+
+async def top_products_process(update: Update, context: ContextTypes.DEFAULT_TYPE, date_from, date_to, period_name):
+    """Обработка и вывод топ товаров"""
+    chat_id = update.effective_chat.id
+    
+    await update.message.reply_text(
+        "⏳ Загружаю данные...",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    
+    try:
+        # Валидация периода
+        valid, result = validate_period(date_from, date_to)
+        if not valid:
+            keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+            await update.message.reply_text(result, reply_markup=keyboard)
+            return ConversationHandler.END
+        
+        # Получаем данные
+        postings = fetch_postings(date_from, date_to)
+        top_products = get_top_products(postings, limit=10)
+        
+        if not top_products:
+            keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+            await update.message.reply_text(
+                "📭 За выбранный период нет данных о доставленных товарах.",
+                reply_markup=keyboard
+            )
+            return ConversationHandler.END
+        
+        # Форматируем сообщение
+        message = f"🏆 <b>ТОП-10 ТОВАРОВ</b>\n"
+        message += f"<b>Период:</b> {period_name}\n\n"
+        
+        for i, (offer_id, stats) in enumerate(top_products, 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            message += (
+                f"{medal} <b>{stats['name'][:50]}</b>\n"
+                f"   Продано: {stats['units_sold']} шт\n"
+                f"   Выручка: {stats['revenue']:,.0f} ₽\n\n"
+            )
+        
+        # Разбиваем на части если слишком длинное
+        if len(message) > 4000:
+            parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
+            for part in parts:
+                await update.message.reply_text(part, parse_mode='HTML')
+        else:
+            await update.message.reply_text(message, parse_mode='HTML')
+        
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text(
+            "✅ Готово!",
+            reply_markup=keyboard
+        )
+        
+    except Exception as e:
+        write_log(f"❌ Ошибка в top_products_process: {e}")
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text(
+            "❌ Произошла ошибка при загрузке данных. Попробуйте позже.",
+            reply_markup=keyboard
+        )
+    
     return ConversationHandler.END
 
-# ---------- ЗАПУСК ----------
-def main():
-    if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]):
-        write_log("❌ ОШИБКА: Не все переменные окружения установлены!")
-        return
-    if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
-        write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
-    write_log("🚀 Запуск бота...")
-    application = (Application.builder()
-                   .token(TELEGRAM_BOT_TOKEN)
-                   .connect_timeout(30.0)
-                   .read_timeout(30.0)
-                   .write_timeout(30.0)
-                   .build())
+async def top_products_year(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора года для топ товаров"""
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    if text == "❌ Отмена" or text == "/cancel":
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text("Отменено.", reply_markup=keyboard)
+        return ConversationHandler.END
+    
+    try:
+        year = int(text)
+        date_from = f"{year}-01-01"
+        date_to = f"{year}-12-31"
+        period_name = f"Год {year}"
+        
+        return await top_products_process(update, context, date_from, date_to, period_name)
+    except:
+        await update.message.reply_text("❌ Неверный формат. Введите год (например: 2024)")
+        return WAITING_TOP_YEAR
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("top", top_products_command))  # Шаг 7
+async def top_products_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора месяца для топ товаров"""
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    if text == "❌ Отмена" or text == "/cancel":
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text("Отменено.", reply_markup=keyboard)
+        return ConversationHandler.END
+    
+    # Парсим "Месяц Год"
+    month_names = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+    
+    for i, month_name in enumerate(month_names, 1):
+        if month_name in text:
+            try:
+                year = int(text.split()[-1])
+                date_from = f"{year}-{i:02d}-01"
+                # Последний день месяца
+                if i == 12:
+                    date_to = f"{year}-12-31"
+                else:
+                    next_month = datetime.date(year, i + 1, 1)
+                    date_to = (next_month - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                
+                period_name = f"{month_name} {year}"
+                return await top_products_process(update, context, date_from, date_to, period_name)
+            except:
+                pass
+    
+    await update.message.reply_text("❌ Неверный формат. Выберите месяц из списка.")
+    return WAITING_TOP_MONTH
 
-    async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def top_products_quarter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора квартала для топ товаров"""
+    text = update.message.text
+    chat_id = update.effective_chat.id
+    
+    if text == "❌ Отмена" or text == "/cancel":
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text("Отменено.", reply_markup=keyboard)
+        return ConversationHandler.END
+    
+    # Парсим "Q1 2024"
+    match = re.match(r'Q(\d) (\d{4})', text)
+    if match:
+        quarter = int(match.group(1))
+        year = int(match.group(2))
+        
+        start_month = (quarter - 1) * 3 + 1
+        end_month = start_month + 2
+        
+        date_from = f"{year}-{start_month:02d}-01"
+        date_to = f"{year}-{end_month:02d}-{calendar.monthrange(year, end_month)[1]}"
+        
+        period_name = f"Q{quarter} {year}"
+        return await top_products_process(update, context, date_from, date_to, period_name)
+    
+    await update.message.reply_text("❌ Неверный формат. Выберите квартал из списка.")
+    return WAITING_TOP_QUARTER
+
+async def top_products_range_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка начальной даты периода"""
+    text = update.message.text
+    
+    if text == "/cancel":
         chat_id = update.effective_chat.id
-        if is_admin(chat_id):
-            help_text = (
-                "📖 *Справка для администратора*\n\n"
-                "🔹 *Основные функции*\n"
-                "• 📊 Отчёт по продажам – актуальная сводка по продажам за сегодня и текущий месяц.\n"
-                "• 📦 Отчёт по товарам – топ товаров по выручке за сегодня и текущий месяц.\n"
-                "• 📆 Выбрать дату – просмотр данных за конкретный день (продажи или товары).\n"
-                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
-                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
-                "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n"
-                "• ⚙️ Администрирование – управление доступом менеджеров.\n\n"
-                "🔹 *Управление менеджерами*\n"
-                "• ➕ Добавить менеджера – введите Telegram ID или @username пользователя, затем номер телефона (или '-' для пропуска).\n"
-                "• ➖ Удалить менеджера – введите Telegram ID пользователя.\n"
-                "• 📋 Список менеджеров – просмотр всех добавленных пользователей (ID, username, имя, телефон).\n\n"
-                "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
-                "🔹 *Метрики*\n"
-                "• 🛒 Заказано – сумма и количество всех заказов.\n"
-                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
-                "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
-                "🔹 *Сравнение динамики*\n"
-                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
-                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
-                "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
-            )
-        else:
-            help_text = (
-                "📖 *Справка для менеджера*\n\n"
-                "🔹 *Основные функции*\n"
-                "• 📊 Отчёт по продажам – актуальная сводка по продажам за сегодня и текущий месяц.\n"
-                "• 📦 Отчёт по товарам – топ товаров по выручке за сегодня и текущий месяц.\n"
-                "• 📆 Выбрать дату – просмотр данных за конкретный день (продажи или товары).\n"
-                "• 📊 Выбрать период – гибкий выбор отчётного периода (месяц, квартал, год, произвольный).\n"
-                "• 📈 Динамика продаж – график доставленных заказов по месяцам за выбранный год (или несколько лет).\n"
-                "• 📈 Динамика по товару – график продаж конкретного товара по месяцам.\n\n"
-                "🔹 *Автоматические отчёты*\n"
-                "• В 10:00 МСК – отчёт с блоками «Вчера», «Сегодня» и «Текущий месяц».\n"
-                "• В 22:00 МСК – отчёт с блоками «Сегодня» и «Текущий месяц».\n\n"
-                "🔹 *Метрики*\n"
-                "• 🛒 Заказано – сумма и количество всех заказов.\n"
-                "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
-                "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
-                "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
-                "🔹 *Сравнение динамики*\n"
-                "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
-                "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
-                "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
-            )
-        await update.message.reply_text(help_text, parse_mode="Markdown")
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text("Отменено.", reply_markup=keyboard)
+        return ConversationHandler.END
+    
+    valid, result = validate_date(text)
+    if not valid:
+        await update.message.reply_text(result)
+        return WAITING_TOP_RANGE_START
+    
+    context.user_data['top_date_from'] = text
+    await update.message.reply_text(
+        "Введите конечную дату периода в формате ГГГГ-ММ-ДД\n"
+        "Например: 2024-12-31\n\n"
+        "Или отправьте /cancel для отмены"
+    )
+    return WAITING_TOP_RANGE_END
+
+async def top_products_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка конечной даты периода"""
+    text = update.message.text
+    
+    if text == "/cancel":
+        chat_id = update.effective_chat.id
+        keyboard = main_admin_keyboard() if is_admin(chat_id) else main_user_keyboard()
+        await update.message.reply_text("Отменено.", reply_markup=keyboard)
+        return ConversationHandler.END
+    
+    valid, result = validate_date(text)
+    if not valid:
+        await update.message.reply_text(result)
+        return WAITING_TOP_RANGE_END
+    
+    date_from = context.user_data.get('top_date_from')
+    date_to = text
+    
+    period_name = f"{date_from} — {date_to}"
+    return await top_products_process(update, context, date_from, date_to, period_name)
+
+# ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
+def main():
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Обработчик /start
+    application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-
-    application.add_handler(MessageHandler(filters.Text(["📊 Отчёт по продажам", "📦 Отчёт по товарам", "⚙️ Администрирование", "📖 Справка"]), handle_main_menu))
-
-    application.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня", "📆 Выбрать дату", "📊 Выбрать период", "📈 Динамика продаж", "🔙 Назад"]), handle_sales_reports))
-    application.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня", "📆 Выбрать дату (товары)", "📊 Выбрать период (товары)", "📈 Динамика по товару", "🔙 Назад"]), handle_products_reports))
-    application.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров", "🔙 Назад"]), handle_admin_menu))
-
-    # Диалоги продаж
-    conv_date = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), handle_sales_reports)],
-        states={WAITING_DATE_SINGLE: [CallbackQueryHandler(handle_callback_query)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_period = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), handle_sales_reports)],
+    application.add_handler(MessageHandler(filters.Regex("^ℹ️ Помощь$"), help_command))
+    
+    # Обработчик топ товаров
+    top_products_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("top_products", top_products_command),
+            MessageHandler(filters.Regex("^🏆 Топ товары$"), top_products_command)
+        ],
         states={
-            WAITING_PERIOD_TYPE: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_START: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_END: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_YEAR: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_MONTH: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PERIOD_QUARTER: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_YEAR_SELECT: [CallbackQueryHandler(handle_callback_query)],
+            WAITING_TOP_PERIOD_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, top_products_period_type)],
+            WAITING_TOP_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, top_products_year)],
+            WAITING_TOP_MONTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, top_products_month)],
+            WAITING_TOP_QUARTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, top_products_quarter)],
+            WAITING_TOP_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, top_products_range_start)],
+            WAITING_TOP_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, top_products_range_end)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", start)],
+        name="top_products_conversation",
+        persistent=False
     )
-    conv_dynamics = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📈 Динамика продаж"), handle_sales_reports)],
-        states={
-            WAITING_DYNAMICS_SELECT: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_DYNAMICS_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_start)],
-            WAITING_DYNAMICS_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_end)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Диалоги товаров
-    conv_product_date = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату (товары)"), handle_products_reports)],
-        states={WAITING_PRODUCT_DATE: [CallbackQueryHandler(handle_callback_query)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_product_period = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📊 Выбрать период (товары)"), handle_products_reports)],
-        states={
-            WAITING_PRODUCT_PERIOD_TYPE: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_PERIOD_START: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_PERIOD_END: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_YEAR: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_MONTH: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_QUARTER: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_YEAR_SELECT: [CallbackQueryHandler(handle_callback_query)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Новый диалог для динамики по товару
-    conv_product_chart = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📈 Динамика по товару"), handle_products_reports)],
-        states={
-            WAITING_PRODUCT_SELECT: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_METRIC: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_PERIOD_CHOICE: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_SINGLE_YEAR: [CallbackQueryHandler(handle_callback_query)],
-            WAITING_PRODUCT_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_start)],
-            WAITING_PRODUCT_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_end)],
-            WAITING_PRODUCT_SKU_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_manual_input)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    # Администрирование
-    conv_add = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), add_manager_start)],
-        states={
-            WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_input)],
-            WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_manager_phone)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    conv_remove = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("➖ Удалить менеджера"), remove_manager_start)],
-        states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, remove_manager_input)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    application.add_handler(conv_date)
-    application.add_handler(conv_period)
-    application.add_handler(conv_dynamics)
-    application.add_handler(conv_product_date)
-    application.add_handler(conv_product_period)
-    application.add_handler(conv_product_chart)
-    application.add_handler(conv_add)
-    application.add_handler(conv_remove)
-    application.add_handler(CallbackQueryHandler(handle_callback_query))
-
-    job_queue = application.job_queue
-    if job_queue:
-        job_queue.run_repeating(scheduled_report, interval=3600, first=0)
-        write_log("✅ Планировщик запущен (отправка в 10:00 и 22:00 МСК).")
-    else:
-        write_log("⚠️ JobQueue недоступен.")
-
-    write_log("🚀 Бот готов.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
-
-async def scheduled_report(context):
-    moscow_tz = MOSCOW_TZ
-    now = datetime.datetime.now(moscow_tz)
-    hour = now.hour
-    if hour not in (10, 22):
-        return
-    include_yesterday = (hour == 10)
-    report = format_combined_metrics_with_deltas(include_yesterday=include_yesterday)
-    managers = load_managers()
-    if not managers:
-        return
-    for m in managers:
-        try:
-            await context.bot.send_message(chat_id=m['id'], text=report, parse_mode="Markdown")
-        except Exception as e:
-            write_log(f"Ошибка отправки {m['id']}: {e}")
+    
+    application.add_handler(top_products_handler)
+    
+    write_log("🚀 Бот запущен с оптимизациями!")
+    write_log(f"✅ Кэширование: активно (TTL {CACHE_TTL_SECONDS}s)")
+    write_log(f"✅ Retry логика: активна ({API_RETRY_ATTEMPTS} попыток)")
+    write_log(f"✅ Параллельные запросы: активны")
+    write_log(f"✅ Валидация данных: активна")
+    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
