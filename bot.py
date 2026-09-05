@@ -89,6 +89,7 @@ WAITING_PRODUCT_PERIOD_CHOICE = 32
 WAITING_PRODUCT_SINGLE_YEAR = 33
 WAITING_PRODUCT_RANGE_START = 34
 WAITING_PRODUCT_RANGE_END = 35
+WAITING_PRODUCT_SKU_MANUAL = 36  # ручной ввод SKU
 # =====================================================
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
@@ -585,9 +586,9 @@ def aggregate_finance_expenses(transactions):
 
     return expense_by_type
 
-# ---------- ФУНКЦИИ ДЛЯ ТОВАРНОЙ АНАЛИТИКИ ----------
+# ---------- ФУНКЦИИ ДЛЯ ТОВАРНОЙ АНАЛИТИКИ (с offer_id) ----------
 def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
-    """Агрегирует данные по товарам за период"""
+    """Агрегирует данные по товарам за период, сохраняя offer_id"""
     product_stats = {}
     for posting in postings:
         created_at = posting.get("created_at", "")
@@ -612,6 +613,7 @@ def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, 
         for product in products:
             sku = str(product.get("sku", "0"))
             name = product.get("name", "Без названия")
+            offer_id = product.get("offer_id", "")  # артикул продавца
             qty = int(product.get("quantity", 0))
             price_str = product.get("price", "0")
             try:
@@ -622,6 +624,7 @@ def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, 
             if sku not in product_stats:
                 product_stats[sku] = {
                     "name": name[:60],
+                    "offer_id": offer_id,
                     "ordered_units": 0,
                     "ordered_sum": 0.0,
                     "delivered_units": 0,
@@ -653,6 +656,7 @@ def format_top_products(products, title, limit=15):
     lines = [f"📦 {title}", ""]
     for idx, (sku, stats) in enumerate(sorted_items, 1):
         name = stats["name"][:40]
+        offer_id = stats.get("offer_id", "")
         ordered_sum = f"{stats['ordered_sum']:,.2f}".replace(",", " ")
         ordered_units = stats["ordered_units"]
         delivered_sum = f"{stats['delivered_sum']:,.2f}".replace(",", " ")
@@ -661,8 +665,7 @@ def format_top_products(products, title, limit=15):
         canceled_units = stats["canceled_units"]
         avg_check = (stats["ordered_sum"] / stats["order_count"]) if stats["order_count"] > 0 else 0
         avg_check_str = f"{avg_check:,.2f}".replace(",", " ")
-        lines.append(f"{idx}. {name}")
-        lines.append(f"   SKU: {sku}")
+        lines.append(f"{idx}. SKU: {sku} | {name} | Арт: {offer_id}" if offer_id else f"{idx}. SKU: {sku} | {name}")
         lines.append(f"   🛒 Заказано: {ordered_sum} ₽ / {ordered_units} шт.")
         lines.append(f"   📦 Доставлено: {delivered_sum} ₽ / {delivered_units} шт.")
         lines.append(f"   ❌ Отменено: {canceled_sum} ₽ / {canceled_units} шт.")
@@ -671,7 +674,6 @@ def format_top_products(products, title, limit=15):
     return "\n".join(lines)
 
 def format_products_summary(products):
-    """Формирует сводку по товарам (без Markdown)"""
     if not products:
         return "Нет данных"
     total_revenue = sum(p["ordered_sum"] for p in products.values())
@@ -688,7 +690,7 @@ def format_products_summary(products):
     )
 
 def get_top_products_for_select(days=30):
-    """Возвращает топ-20 товаров за последние N дней для выбора"""
+    """Возвращает топ-20 товаров за последние N дней с offer_id для выбора"""
     now = get_current_time_msk()
     end_date = now.date().isoformat()
     start_date = (now.date() - datetime.timedelta(days=days)).isoformat()
@@ -696,7 +698,7 @@ def get_top_products_for_select(days=30):
     products = aggregate_products(postings, date_from=start_date, date_to=end_date,
                                   time_limit=now.time(), apply_limit_on_day=end_date)
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:20]
-    return sorted_items
+    return [(sku, stats) for sku, stats in sorted_items]
 
 def generate_product_chart_by_metric(sku, metric, years):
     """
@@ -749,14 +751,9 @@ def generate_product_chart_by_metric(sku, metric, years):
                 elif metric == 'canceled_units' and status in ("cancelled", "canceled"):
                     monthly_data[month_idx] += qty
                 elif metric == 'avg_check':
-                    # Для среднего чека собираем сумму и количество заказов
-                    # Будем считать средний чек как (сумма всех заказов) / (количество заказов)
-                    # Для этого накапливаем сумму и количество заказов отдельно
-                    # Здесь проще пересчитать средний чек в конце
-                    monthly_data[month_idx] += price * qty  # сумма
+                    monthly_data[month_idx] += price * qty
                     order_counts[month_idx] += 1
         if metric == 'avg_check':
-            # Пересчитываем средний чек
             for m in range(12):
                 if order_counts[m] > 0:
                     monthly_data[m] = monthly_data[m] / order_counts[m]
@@ -770,7 +767,6 @@ def generate_product_chart_by_metric(sku, metric, years):
     fig, ax = plt.subplots(figsize=(10, 6))
     months = [datetime.date(2000, m, 1) for m in range(1, 13)]
 
-    # Определяем название метрики для подписи
     metric_labels = {
         'ordered_sum': 'Заказано (₽)',
         'ordered_units': 'Заказано (шт.)',
@@ -792,7 +788,6 @@ def generate_product_chart_by_metric(sku, metric, years):
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
     ax.grid(True, linestyle='--', alpha=0.7)
     ax.legend()
-    # Форматирование оси Y
     if metric in ['ordered_sum', 'delivered_sum', 'canceled_sum', 'avg_check']:
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{int(x):,}'.replace(',', ' ')))
     plt.tight_layout()
@@ -1545,23 +1540,29 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Выберите тип периода для товаров:", reply_markup=keyboard)
         return WAITING_PRODUCT_PERIOD_TYPE
     elif text == "📈 Динамика по товару":
-        # Показываем список товаров
+        # Показываем список товаров в формате "SKU Наименование Артикул"
         await update.message.reply_text("⏳ Загружаю список товаров за последние 30 дней...")
         top_products = get_top_products_for_select(days=30)
         if not top_products:
             await update.message.reply_text("❌ Нет данных о товарах за последние 30 дней.")
             return ConversationHandler.END
-        # Сохраняем список в user_data для последующего использования
+        # Сохраняем список в user_data
         context.user_data['product_list'] = top_products
-        # Формируем inline кнопки с номерами товаров (не более 20)
+        # Формируем inline-кнопки
         keyboard = []
         for idx, (sku, stats) in enumerate(top_products, 1):
-            name = stats['name'][:30]
-            # Кнопка с номером и коротким названием
-            keyboard.append([InlineKeyboardButton(f"{idx}. {name}", callback_data=f"prod_{sku}")])
+            name = stats['name'][:30]  # обрезаем для кнопки
+            offer_id = stats.get('offer_id', '')
+            if offer_id:
+                text = f"{idx}. SKU:{sku} {name} (Арт:{offer_id})"
+            else:
+                text = f"{idx}. SKU:{sku} {name}"
+            keyboard.append([InlineKeyboardButton(text, callback_data=f"prod_{sku}")])
+        # Добавляем кнопку ручного ввода
+        keyboard.append([InlineKeyboardButton("✏️ Ввести SKU вручную", callback_data="prod_manual")])
         keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="prod_cancel")])
         await update.message.reply_text(
-            "Выберите товар, нажав на соответствующую кнопку:",
+            "Выберите товар, нажав на соответствующую кнопку, или введите SKU вручную:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_PRODUCT_SELECT
@@ -1696,6 +1697,46 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Действие отменено.", reply_markup=keyboard)
     return ConversationHandler.END
 
+# ---------- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ РУЧНОГО ВВОДА SKU ----------
+async def product_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("Введите SKU товара (числовой идентификатор):")
+    return WAITING_PRODUCT_SKU_MANUAL
+
+async def product_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_text("❌ SKU должен быть числом. Попробуйте снова или отмените командой /cancel.")
+        return WAITING_PRODUCT_SKU_MANUAL
+    sku = text
+    # Проверим, есть ли такой товар в сохранённом списке
+    product_list = context.user_data.get('product_list', [])
+    product_name = "Товар"
+    for p_sku, stats in product_list:
+        if p_sku == sku:
+            product_name = stats['name'][:40]
+            break
+    context.user_data['product_sku'] = sku
+    context.user_data['product_name'] = product_name
+
+    # Предлагаем выбрать метрику
+    keyboard = [
+        [InlineKeyboardButton("Заказано (₽)", callback_data="metric_ordered_sum")],
+        [InlineKeyboardButton("Заказано (шт.)", callback_data="metric_ordered_units")],
+        [InlineKeyboardButton("Доставлено (₽)", callback_data="metric_delivered_sum")],
+        [InlineKeyboardButton("Доставлено (шт.)", callback_data="metric_delivered_units")],
+        [InlineKeyboardButton("Отменено (₽)", callback_data="metric_canceled_sum")],
+        [InlineKeyboardButton("Отменено (шт.)", callback_data="metric_canceled_units")],
+        [InlineKeyboardButton("Средний чек (₽)", callback_data="metric_avg_check")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="metric_cancel")]
+    ]
+    await update.message.reply_text(
+        f"Выбран товар: {product_name} (SKU: {sku})\nТеперь выберите метрику для графика:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_PRODUCT_METRIC
+
 # ---------- ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
 async def product_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1705,6 +1746,10 @@ async def product_select_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Выбор товара отменён.")
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
         return ConversationHandler.END
+
+    if data == "prod_manual":
+        await query.edit_message_text("Введите SKU товара (числовой идентификатор):")
+        return WAITING_PRODUCT_SKU_MANUAL
 
     if data.startswith("prod_"):
         sku = data[5:]  # убираем "prod_"
@@ -2359,6 +2404,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # ---------- НОВЫЕ ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
     if data.startswith("prod_"):
         return await product_select_callback(update, context)
+    if data == "prod_manual":
+        return await product_manual_callback(update, context)
     if data.startswith("metric_"):
         return await product_metric_callback(update, context)
     if data.startswith("period_") or data.startswith("year_") or data == "period_cancel" or data == "period_current" or data == "period_select_year" or data == "period_range":
@@ -2551,6 +2598,7 @@ def main():
             WAITING_PRODUCT_SINGLE_YEAR: [CallbackQueryHandler(handle_callback_query)],
             WAITING_PRODUCT_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_start)],
             WAITING_PRODUCT_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_end)],
+            WAITING_PRODUCT_SKU_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_manual_input)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
