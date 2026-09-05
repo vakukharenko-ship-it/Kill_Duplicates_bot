@@ -20,13 +20,36 @@ import io
 from matplotlib.dates import MonthLocator, DateFormatter
 import matplotlib.dates as mdates
 
+# ==================== КОНСТАНТЫ ====================
+API_TIMEOUT = 15
+API_MAX_DAYS_PER_REQUEST = 90
+API_RETRY_ATTEMPTS = 3
+API_RETRY_DELAY = 2
+DEBUG_SAMPLE_SIZE = 10
+CACHE_TTL_SECONDS = 300  # 5 минут
+
+# ==================== КЭШ ====================
+_api_cache = {}
+_cache_timestamps = {}
+
+def get_from_cache(key):
+    if key in _api_cache:
+        timestamp = _cache_timestamps.get(key)
+        if timestamp and (time.time() - timestamp) < CACHE_TTL_SECONDS:
+            return _api_cache[key]
+    return None
+
+def save_to_cache(key, value):
+    _api_cache[key] = value
+    _cache_timestamps[key] = time.time()
+
 # ==================== КОНФИГУРАЦИЯ ====================
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
 OZON_PERFORMANCE_CLIENT_ID = os.getenv("OZON_PERFORMANCE_CLIENT_ID")
 OZON_PERFORMANCE_CLIENT_SECRET = os.getenv("OZON_PERFORMANCE_CLIENT_SECRET")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ADMIN_CHAT_ID = 6134182006
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v2/posting/fbo/list"
 OZON_FINANCE_URL = "https://api-seller.ozon.ru/v3/finance/transaction/list"
@@ -180,8 +203,37 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
+# ---------- Функции API с retry и кэшированием ----------
+def api_request_with_retry(url, headers, payload=None, method='POST', timeout=API_TIMEOUT):
+    for attempt in range(API_RETRY_ATTEMPTS):
+        try:
+            if method == 'POST':
+                response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            else:
+                response = requests.get(url, headers=headers, params=payload, timeout=timeout)
+
+            if response.status_code == 429:
+                wait_time = API_RETRY_DELAY * (2 ** attempt)
+                write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
+                time.sleep(wait_time)
+                continue
+
+            response.raise_for_status()
+            return response
+
+        except requests.exceptions.RequestException as e:
+            if attempt == API_RETRY_ATTEMPTS - 1:
+                raise
+            write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
+            time.sleep(API_RETRY_DELAY)
+
 # ---------- Функции для получения данных Ozon (отгрузки) ----------
 def fetch_postings(date_from, date_to):
+    cache_key = f"fetch_postings_{date_from}_{date_to}"
+    cached = get_from_cache(cache_key)
+    if cached is not None:
+        return cached
+
     headers = {
         "Client-Id": OZON_CLIENT_ID,
         "Api-Key": OZON_API_KEY,
@@ -197,11 +249,7 @@ def fetch_postings(date_from, date_to):
     all_postings = []
     while True:
         try:
-            response = requests.post(OZON_POSTING_FBO_URL, headers=headers, json=payload, timeout=15)
-            if response.status_code == 429:
-                time.sleep(10)
-                continue
-            response.raise_for_status()
+            response = api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload, method='POST')
             data = response.json()
             postings = data.get("result", [])
             if not postings:
@@ -214,6 +262,7 @@ def fetch_postings(date_from, date_to):
             write_log(f"❌ Ошибка получения отгрузок: {e}")
             break
     write_log(f"📦 Загружено отгрузок: {len(all_postings)} за {date_from}–{date_to}")
+    save_to_cache(cache_key, all_postings)
     return all_postings
 
 def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
@@ -290,8 +339,7 @@ def get_performance_token():
         "grant_type": "client_credentials"
     }
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        response.raise_for_status()
+        response = api_request_with_retry(url, headers, payload, method='POST')
         token_data = response.json()
         token = token_data.get("access_token")
         if token:
@@ -305,6 +353,11 @@ def get_performance_token():
         return None
 
 def fetch_advertising_expense_single(date_from, date_to):
+    cache_key = f"fetch_advertising_expense_single_{date_from}_{date_to}"
+    cached = get_from_cache(cache_key)
+    if cached is not None:
+        return cached
+
     token = get_performance_token()
     if not token:
         return 0.0
@@ -319,21 +372,7 @@ def fetch_advertising_expense_single(date_from, date_to):
         "dateTo": date_to,
     }
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=15)
-        if response.status_code == 429:
-            write_log("⚠️ 429 Too Many Requests, ждём 10 сек")
-            time.sleep(10)
-            response = requests.get(url, headers=headers, params=params, timeout=15)
-
-        if response.status_code == 400:
-            error_text = response.text
-            if "interval of report is in the future" in error_text:
-                write_log(f"⏭️ Пропускаем будущий период: {date_from}–{date_to}")
-            else:
-                write_log(f"⚠️ Performance API вернул 400 для {date_from}–{date_to}: {error_text[:200]}")
-            return 0.0
-
-        response.raise_for_status()
+        response = api_request_with_retry(url, headers, params, method='GET')
         data = response.json()
         total_expense = 0.0
         if isinstance(data, dict) and "rows" in data:
@@ -351,6 +390,7 @@ def fetch_advertising_expense_single(date_from, date_to):
                                     total_expense += money_spent
                                 except:
                                     pass
+        save_to_cache(cache_key, total_expense)
         return total_expense
     except Exception as e:
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
@@ -366,7 +406,7 @@ def fetch_advertising_expense(date_from, date_to):
         end_dt = datetime.datetime.combine(today, datetime.time(23, 59, 59))
 
     delta = (end_dt - start_dt).days
-    if delta <= 90:
+    if delta <= API_MAX_DAYS_PER_REQUEST:
         return fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
 
     total = 0.0
@@ -387,6 +427,11 @@ def fetch_advertising_expense(date_from, date_to):
 
 # ---------- Функции для финансовых транзакций с разбивкой по месяцам ----------
 def fetch_finance_transactions_single(date_from, date_to):
+    cache_key = f"fetch_finance_transactions_single_{date_from}_{date_to}"
+    cached = get_from_cache(cache_key)
+    if cached is not None:
+        return cached
+
     today_str = get_moscow_today().isoformat()
     if date_from > today_str:
         return []
@@ -419,35 +464,21 @@ def fetch_finance_transactions_single(date_from, date_to):
         }
 
         try:
-            response = requests.post(OZON_FINANCE_URL, headers=headers, json=payload, timeout=15)
-
-            if response.status_code == 429:
-                time.sleep(10)
-                continue
-
-            if response.status_code == 400:
-                write_log(f"⚠️ Finance API вернул 400 для {date_from}–{date_to}: {response.text[:200]}")
-                break
-
-            response.raise_for_status()
+            response = api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
             data = response.json()
             items = data.get("result", {}).get("operations", [])
             if not items:
                 break
-
             all_transactions.extend(items)
             if len(items) < page_size:
                 break
             page += 1
 
-        except requests.exceptions.HTTPError as e:
-            error_text = e.response.text if e.response else str(e)
-            write_log(f"❌ Ошибка получения финансовых транзакций: {e}, ответ: {error_text[:500]}")
-            break
         except Exception as e:
             write_log(f"❌ Ошибка получения финансовых транзакций: {e}")
             break
 
+    save_to_cache(cache_key, all_transactions)
     return all_transactions
 
 def fetch_finance_transactions(date_from, date_to):
@@ -460,7 +491,7 @@ def fetch_finance_transactions(date_from, date_to):
         end_dt = datetime.datetime.combine(today, datetime.time(23, 59, 59))
 
     delta = (end_dt - start_dt).days
-    if delta <= 90:
+    if delta <= API_MAX_DAYS_PER_REQUEST:
         return fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
 
     all_transactions = []
@@ -486,13 +517,12 @@ def aggregate_finance_expenses(transactions):
     expense_by_type = {}
     unique_types = set()
     unique_services = set()
-    sample_count = 0
+    sample_transactions = []
+
     for t in transactions:
-        if sample_count < 10:
-            services = t.get("services", [])
-            if services:
-                write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, accruals_for_sale={t.get('accruals_for_sale')}, services={json.dumps(services, ensure_ascii=False)}")
-                sample_count += 1
+        services = t.get("services", [])
+        if services and len(sample_transactions) < DEBUG_SAMPLE_SIZE:
+            sample_transactions.append(t)
 
         sale_comm = t.get("sale_commission", 0)
         if sale_comm < 0:
@@ -532,6 +562,12 @@ def aggregate_finance_expenses(transactions):
         else:
             if amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
+
+    # Логируем примеры транзакций одним блоком
+    if sample_transactions:
+        for t in sample_transactions:
+            services = t.get("services", [])
+            write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, accruals_for_sale={t.get('accruals_for_sale')}, services={json.dumps(services, ensure_ascii=False)}")
 
     if transactions:
         write_log(f"🔍 Найдены operation_type: {', '.join(unique_types)}")
@@ -986,8 +1022,8 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  ❌ Отменено: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
             f"    vs предыдущий месяц: \n  {delta_can_sum_m} ₽ / {delta_can_units_m} шт.\n\n"
             f"  📢 Реклама: \n  {ad_expense} ₽ | vs предыдущий месяц: {ad_prev} ₽\n"
-            f"  ДРР общ: {drr_str} | vs предыдущий месяц: {prev_drr_str}\n"
-            f"  ДРР дост: {eff_drr_str} | vs предыдущий месяц: {prev_eff_drr_str}"
+            f"  ДРР (общий): {drr_str} | vs предыдущий месяц: {prev_drr_str}\n"
+            f"  ДРР (по доставленным): {eff_drr_str} | vs предыдущий месяц: {prev_eff_drr_str}"
         )
 
     parts = []
@@ -1319,7 +1355,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
                 "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
@@ -1344,7 +1380,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
                 "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
@@ -2187,7 +2223,7 @@ def main():
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
                 "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
@@ -2212,7 +2248,7 @@ def main():
                 "• 🛒 Заказано – сумма и количество всех заказов.\n"
                 "• 📦 Доставлено – сумма и количество доставленных заказов.\n"
                 "• ❌ Отменено – сумма и количество отменённых заказов.\n"
-                "• 📢 Реклама – расходы на рекламу, ДРР общий и ДРР по доставленным.\n"
+                "• 📢 Реклама – расходы на рекламу, ДРР (общий) и ДРР (по доставленным).\n"
                 "• 💰 Расходы (финансовые) – детальная разбивка: комиссии, логистика, эквайринг, кросс-докинг, хранение, возвраты и др.\n\n"
                 "🔹 *Сравнение динамики*\n"
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
