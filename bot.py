@@ -14,6 +14,9 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 from telegram.helpers import escape_markdown
 
+# Для параллельных запросов
+from concurrent.futures import ThreadPoolExecutor
+
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # Графики
@@ -211,6 +214,36 @@ def create_calendar(year, month, callback_prefix):
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
+# ---------- Валидация дат (Шаг 8) ----------
+def validate_date(date_str):
+    """Проверка корректности даты"""
+    try:
+        date = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        today = get_moscow_today()
+        if date > today:
+            return False, "❌ Дата не может быть в будущем"
+        two_years_ago = today - datetime.timedelta(days=730)
+        if date < two_years_ago:
+            return False, "❌ Дата слишком старая (более 2 лет назад)"
+        return True, date
+    except ValueError:
+        return False, "❌ Неверный формат даты. Используйте YYYY-MM-DD"
+
+def validate_period(date_from, date_to):
+    """Проверка корректности периода"""
+    valid_from, from_date = validate_date(date_from)
+    if not valid_from:
+        return False, from_date
+    valid_to, to_date = validate_date(date_to)
+    if not valid_to:
+        return False, to_date
+    if from_date > to_date:
+        return False, "❌ Начальная дата не может быть позже конечной"
+    delta = (to_date - from_date).days
+    if delta > 365:
+        return False, "❌ Период не может быть больше года"
+    return True, (from_date, to_date)
+
 # ---------- Функции API с retry и кэшированием ----------
 def api_request_with_retry(url, headers, payload=None, method='POST', timeout=API_TIMEOUT):
     for attempt in range(API_RETRY_ATTEMPTS):
@@ -405,6 +438,12 @@ def fetch_advertising_expense_single(date_from, date_to):
         return 0.0
 
 def fetch_advertising_expense(date_from, date_to):
+    # Добавляем кэширование для всего периода (Шаг 1)
+    cache_key = f"fetch_advertising_expense_{date_from}_{date_to}"
+    cached = get_from_cache(cache_key)
+    if cached is not None:
+        return cached
+
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
     today = get_moscow_today()
@@ -415,7 +454,9 @@ def fetch_advertising_expense(date_from, date_to):
 
     delta = (end_dt - start_dt).days
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        return fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        save_to_cache(cache_key, result)
+        return result
 
     total = 0.0
     current = start_dt.replace(day=1)
@@ -431,6 +472,7 @@ def fetch_advertising_expense(date_from, date_to):
         total += fetch_advertising_expense_single(month_start, month_end)
         current = current.replace(day=28) + datetime.timedelta(days=4)
         current = current.replace(day=1)
+    save_to_cache(cache_key, total)
     return total
 
 # ---------- Функции для финансовых транзакций с разбивкой по месяцам ----------
@@ -490,6 +532,12 @@ def fetch_finance_transactions_single(date_from, date_to):
     return all_transactions
 
 def fetch_finance_transactions(date_from, date_to):
+    # Добавляем кэширование для всего периода (Шаг 1)
+    cache_key = f"fetch_finance_transactions_{date_from}_{date_to}"
+    cached = get_from_cache(cache_key)
+    if cached is not None:
+        return cached
+
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
     today = get_moscow_today()
@@ -500,7 +548,9 @@ def fetch_finance_transactions(date_from, date_to):
 
     delta = (end_dt - start_dt).days
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        return fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        save_to_cache(cache_key, result)
+        return result
 
     all_transactions = []
     current = start_dt.replace(day=1)
@@ -518,20 +568,25 @@ def fetch_finance_transactions(date_from, date_to):
         current = current.replace(day=1)
 
     write_log(f"💰 Всего загружено финансовых транзакций: {len(all_transactions)} за {date_from}–{date_to}")
+    save_to_cache(cache_key, all_transactions)
     return all_transactions
 
 # ---------- АГРЕГАЦИЯ ФИНАНСОВЫХ РАСХОДОВ (без доходов) ----------
 def aggregate_finance_expenses(transactions):
+    # Оптимизация: сбор примеров без логирования внутри цикла (Шаг 3)
     expense_by_type = {}
     unique_types = set()
     unique_services = set()
     sample_transactions = []
 
     for t in transactions:
-        services = t.get("services", [])
-        if services and len(sample_transactions) < DEBUG_SAMPLE_SIZE:
-            sample_transactions.append(t)
+        # Собираем примеры для логирования (без I/O)
+        if len(sample_transactions) < DEBUG_SAMPLE_SIZE:
+            services = t.get("services", [])
+            if services:
+                sample_transactions.append(t)
 
+        # Обработка расходов
         sale_comm = t.get("sale_commission", 0)
         if sale_comm < 0:
             expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
@@ -571,7 +626,7 @@ def aggregate_finance_expenses(transactions):
             if amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
 
-    # Логируем примеры транзакций одним блоком
+    # Логируем примеры транзакций одним блоком после цикла
     if sample_transactions:
         for t in sample_transactions:
             services = t.get("services", [])
@@ -877,6 +932,49 @@ def format_expense_block(expenses_by_type, title):
 
     return "\n".join(lines)
 
+# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ (Шаг 4) ----------
+def fetch_metrics_parallel(date_from, date_to):
+    """Параллельно загружает отгрузки, рекламу и финансовые транзакции для указанного периода."""
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_postings = executor.submit(fetch_postings, date_from, date_to)
+        future_ad = executor.submit(fetch_advertising_expense, date_from, date_to)
+        future_finance = executor.submit(fetch_finance_transactions, date_from, date_to)
+        postings = future_postings.result()
+        ad_expense = future_ad.result()
+        transactions = future_finance.result()
+    return postings, ad_expense, transactions
+
+def fetch_metrics_for_period_parallel(date_from, date_to):
+    """Обёртка для получения агрегированных метрик с параллельными запросами."""
+    postings, ad_expense, transactions = fetch_metrics_parallel(date_from, date_to)
+    agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
+    total = {
+        "ordered_units": 0,
+        "ordered_sum": 0.0,
+        "delivered_units": 0,
+        "delivered_sum": 0.0,
+        "canceled_units": 0,
+        "canceled_sum": 0.0,
+    }
+    for vals in agg.values():
+        for key in total:
+            total[key] += vals.get(key, 0)
+    total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
+    revenue = total.get("ordered_sum", 0)
+    if revenue > 0 and ad_expense is not None:
+        total["drr"] = (ad_expense / revenue) * 100
+    else:
+        total["drr"] = None
+    delivered_revenue = total.get("delivered_sum", 0)
+    if delivered_revenue > 0 and ad_expense is not None:
+        total["effective_drr"] = (ad_expense / delivered_revenue) * 100
+    else:
+        total["effective_drr"] = None
+
+    expenses = aggregate_finance_expenses(transactions)
+    total["expenses"] = expenses
+    return total
+
 # ---------- Остальные вспомогательные функции ----------
 def get_current_time_msk():
     return datetime.datetime.now(MOSCOW_TZ)
@@ -900,9 +998,18 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 
     days_passed = (today_date - current_month_start).days + 1
 
+    # Параллельные запросы для текущего и предыдущего месяцев
+    # Для текущего месяца запрашиваем данные с начала до сегодня (включая сегодня с ограничением по времени)
+    # Для предыдущего месяца - аналогичный период
+    # Также запрашиваем отдельно для сегодня и вчера
+    # Используем параллельную загрузку для каждого периода отдельно, чтобы не смешивать
+
+    # Загружаем данные для текущего месяца
     postings_current = fetch_postings(current_month_start_str, current_month_end_str)
+    # Загружаем данные для предыдущего месяца
     postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
+    # Агрегация для вчера и сегодня с учётом времени
     agg_yesterday_full = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -968,18 +1075,24 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         for key in prev_month_metrics:
             prev_month_metrics[key] += vals.get(key, 0)
 
-    ad_today = fetch_advertising_expense(today_str, today_str)
-    ad_yesterday = fetch_advertising_expense(yesterday_str, yesterday_str)
+    # Рекламные расходы и финансы - параллельно для всех нужных периодов
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_ad_today = executor.submit(fetch_advertising_expense, today_str, today_str)
+        future_ad_yesterday = executor.submit(fetch_advertising_expense, yesterday_str, yesterday_str)
+        future_ad_month = executor.submit(fetch_advertising_expense, current_month_start_str, today_str)
+        future_ad_prev = executor.submit(fetch_advertising_expense, previous_month_start_str, prev_period_end_str)
+        future_fin_today = executor.submit(fetch_finance_transactions, today_str, today_str)
+        future_fin_month = executor.submit(fetch_finance_transactions, current_month_start_str, today_str)
 
-    # Для текущего месяца берём с 1-го по сегодня (с учётом времени для отгрузок, но для рекламы время не важно)
-    ad_month = fetch_advertising_expense(current_month_start_str, today_str)
+        ad_today = future_ad_today.result()
+        ad_yesterday = future_ad_yesterday.result()
+        ad_month = future_ad_month.result()
+        ad_prev_period = future_ad_prev.result()
+        fin_today = future_fin_today.result()
+        fin_month = future_fin_month.result()
 
-    # Для предыдущего месяца берём аналогичный период (с 1-го по prev_period_end)
-    ad_prev_period = fetch_advertising_expense(previous_month_start_str, prev_period_end_str)
-
-    # Финансовые расходы (без доходов)
-    expenses_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
-    expenses_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, today_str))
+    expenses_today = aggregate_finance_expenses(fin_today)
+    expenses_month = aggregate_finance_expenses(fin_month)
 
     # Добавляем рекламу в расходы
     if ad_today > 0:
@@ -987,6 +1100,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     if ad_month > 0:
         expenses_month["Реклама"] = ad_month
 
+    # Остальной код без изменений (форматирование)
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
 
@@ -1185,10 +1299,17 @@ def get_metrics_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
-    postings = fetch_postings(start, end)
+    # Параллельно загружаем посты, рекламу и финансы за указанную дату
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_postings = executor.submit(fetch_postings, start, end)
+        future_ad = executor.submit(fetch_advertising_expense, date_str, date_str)
+        future_fin = executor.submit(fetch_finance_transactions, date_str, date_str)
+        postings = future_postings.result()
+        ad_expense = future_ad.result()
+        transactions = future_fin.result()
+
     agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
     metrics = agg.get(date_str, {})
-    ad_expense = fetch_advertising_expense(date_str, date_str)
     metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
     revenue = metrics.get("ordered_sum", 0)
     if revenue > 0 and ad_expense is not None:
@@ -1201,40 +1322,13 @@ def get_metrics_for_date(date_str):
     else:
         metrics["effective_drr"] = None
 
-    expenses = aggregate_finance_expenses(fetch_finance_transactions(date_str, date_str))
+    expenses = aggregate_finance_expenses(transactions)
     metrics["expenses"] = expenses
     return metrics
 
 def get_metrics_for_period(date_from, date_to):
-    postings = fetch_postings(date_from, date_to)
-    agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
-    total = {
-        "ordered_units": 0,
-        "ordered_sum": 0.0,
-        "delivered_units": 0,
-        "delivered_sum": 0.0,
-        "canceled_units": 0,
-        "canceled_sum": 0.0,
-    }
-    for vals in agg.values():
-        for key in total:
-            total[key] += vals.get(key, 0)
-    ad_expense = fetch_advertising_expense(date_from, date_to)
-    total["ad_expense"] = ad_expense if ad_expense is not None else 0.0
-    revenue = total.get("ordered_sum", 0)
-    if revenue > 0 and ad_expense is not None:
-        total["drr"] = (ad_expense / revenue) * 100
-    else:
-        total["drr"] = None
-    delivered_revenue = total.get("delivered_sum", 0)
-    if delivered_revenue > 0 and ad_expense is not None:
-        total["effective_drr"] = (ad_expense / delivered_revenue) * 100
-    else:
-        total["effective_drr"] = None
-
-    expenses = aggregate_finance_expenses(fetch_finance_transactions(date_from, date_to))
-    total["expenses"] = expenses
-    return total
+    # Используем параллельную версию
+    return fetch_metrics_for_period_parallel(date_from, date_to)
 
 # ---------- ТОВАРНЫЕ ОТЧЁТЫ ----------
 def get_product_data_for_date(date_str):
@@ -1304,6 +1398,42 @@ def format_product_combined():
         parts.append(f"  Единиц: {total_units_current} vs {total_units_prev} (Δ {delta_units:.1f}%)" if delta_units is not None else "  Единиц: нет данных")
 
     return "📦 Отчёт по товарам\n\n\n" + "\n\n".join(parts)
+
+# ---------- НОВАЯ КОМАНДА /топ_товары (Шаг 7) ----------
+async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.")
+        return
+
+    # Получаем данные за текущий месяц
+    now = get_current_time_msk()
+    today_date = now.date()
+    month_start = today_date.replace(day=1).isoformat()
+    today_str = today_date.isoformat()
+    postings = fetch_postings(month_start, today_str)
+    products = aggregate_products(postings, date_from=month_start, date_to=today_str,
+                                  time_limit=now.time(), apply_limit_on_day=today_str)
+
+    if not products:
+        await update.message.reply_text("❌ Нет данных о товарах за текущий месяц.")
+        return
+
+    # Формируем топ-10 по выручке
+    sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:10]
+    lines = ["🏆 <b>ТОП-10 ТОВАРОВ ЗА ТЕКУЩИЙ МЕСЯЦ</b>\n"]
+    for i, (sku, stats) in enumerate(sorted_items, 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        name = stats.get("name", "Без названия")[:40]
+        offer_id = stats.get("offer_id", "")
+        revenue = stats["ordered_sum"]
+        units = stats["ordered_units"]
+        line = f"{medal} <b>{name}</b>"
+        if offer_id:
+            line += f" (Арт: {offer_id})"
+        line += f"\n   Выручка: {revenue:,.0f} ₽, шт: {units}\n"
+        lines.append(line)
+    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
 # ---------- КЛАВИАТУРЫ ----------
 def main_admin_keyboard():
@@ -1965,6 +2095,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return WAITING_DATE_SINGLE
         date_str = data[5:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            # Валидация даты
+            valid, result = validate_date(date_str)
+            if not valid:
+                await query.edit_message_text(result)
+                return WAITING_DATE_SINGLE
             metrics = get_metrics_for_date(date_str)
             msg = format_single_metrics(metrics, f"Продажи за {date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
@@ -2092,6 +2227,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return WAITING_PERIOD_START
         date_str = data[6:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            valid, result = validate_date(date_str)
+            if not valid:
+                await query.edit_message_text(result)
+                return WAITING_PERIOD_START
             context.user_data['period_start_date'] = date_str
             now = get_moscow_today()
             keyboard = create_calendar(now.year, now.month, "end_")
@@ -2127,12 +2266,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return WAITING_PERIOD_END
         end_date_str = data[4:]
         if re.match(r"\d{4}-\d{2}-\d{2}", end_date_str):
+            valid, result = validate_date(end_date_str)
+            if not valid:
+                await query.edit_message_text(result)
+                return WAITING_PERIOD_END
             start_date = context.user_data.get('period_start_date')
             if not start_date:
                 await query.edit_message_text("❌ Ошибка: начальная дата не найдена. Попробуйте снова.")
                 return ConversationHandler.END
-            if start_date > end_date_str:
-                await query.edit_message_text("❌ Начальная дата позже конечной. Попробуйте сначала.")
+            # Валидация периода
+            valid_period, msg = validate_period(start_date, end_date_str)
+            if not valid_period:
+                await query.edit_message_text(msg)
                 now = get_moscow_today()
                 keyboard = create_calendar(now.year, now.month, "start_")
                 await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
@@ -2214,6 +2359,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return WAITING_PRODUCT_DATE
         date_str = data[6:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            # Валидация даты
+            valid, result = validate_date(date_str)
+            if not valid:
+                await query.edit_message_text(result)
+                return WAITING_PRODUCT_DATE
             products = get_product_data_for_date(date_str)
             msg = format_top_products(products, f"Товары за {date_str}", limit=20)
             summary = format_products_summary(products)
@@ -2345,6 +2495,10 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return WAITING_PRODUCT_PERIOD_START
         date_str = data[7:]
         if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            valid, result = validate_date(date_str)
+            if not valid:
+                await query.edit_message_text(result)
+                return WAITING_PRODUCT_PERIOD_START
             context.user_data['p_start_date'] = date_str
             now = get_moscow_today()
             keyboard = create_calendar(now.year, now.month, "pend_")
@@ -2380,12 +2534,18 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             return WAITING_PRODUCT_PERIOD_END
         end_date_str = data[5:]
         if re.match(r"\d{4}-\d{2}-\d{2}", end_date_str):
+            valid, result = validate_date(end_date_str)
+            if not valid:
+                await query.edit_message_text(result)
+                return WAITING_PRODUCT_PERIOD_END
             start_date = context.user_data.get('p_start_date')
             if not start_date:
                 await query.edit_message_text("❌ Ошибка: начальная дата не найдена. Попробуйте снова.")
                 return ConversationHandler.END
-            if start_date > end_date_str:
-                await query.edit_message_text("❌ Начальная дата позже конечной. Попробуйте сначала.")
+            # Валидация периода
+            valid_period, msg = validate_period(start_date, end_date_str)
+            if not valid_period:
+                await query.edit_message_text(msg)
                 now = get_moscow_today()
                 keyboard = create_calendar(now.year, now.month, "pstart_")
                 await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
@@ -2472,6 +2632,7 @@ def main():
                    .build())
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("top", top_products_command))  # Шаг 7
 
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
