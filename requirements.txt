@@ -1,6 +1,4 @@
 python-telegram-bot[job-queue]==20.6
 aiohttp
-aiodns
-cchardet
 matplotlib
 Pillow
