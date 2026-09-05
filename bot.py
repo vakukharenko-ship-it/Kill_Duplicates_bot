@@ -292,30 +292,43 @@ def validate_period(date_from, date_to):
 
 # ---------- Функции API с retry и кэшированием ----------
 async def api_request_with_retry(url, headers, payload=None, method='POST', timeout=API_TIMEOUT):
+    session = await init_http_session()
+
     for attempt in range(API_RETRY_ATTEMPTS):
         try:
+            await _rate_limiter.acquire()
+
             if method == 'POST':
-                response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status == 429:
+                        wait_time = API_RETRY_DELAY * (2 ** attempt)
+                        write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    response.raise_for_status()
+                    return await response.json()
             else:
-                response = requests.get(url, headers=headers, params=payload, timeout=timeout)
+                async with session.get(url, headers=headers, params=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
+                    if response.status == 429:
+                        wait_time = API_RETRY_DELAY * (2 ** attempt)
+                        write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                        continue
 
-            if response.status_code == 429:
-                wait_time = API_RETRY_DELAY * (2 ** attempt)
-                write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
-                await asyncio.sleep(wait_time)
-                continue
+                    response.raise_for_status()
+                    return await response.json()
 
-            response.raise_for_status()
-            return response
-
-        except requests.exceptions.RequestException as e:
+        except aiohttp.ClientError as e:
             if attempt == API_RETRY_ATTEMPTS - 1:
                 raise
             write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
             await asyncio.sleep(API_RETRY_DELAY)
 
+    raise Exception("All retry attempts failed")
+
 # ---------- Функции для получения данных Ozon (отгрузки) ----------
-async def fetch_postings(date_from, date_to):
+def fetch_postings(date_from, date_to):
     cache_key = f"fetch_postings_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
     if cached is not None:
@@ -336,7 +349,7 @@ async def fetch_postings(date_from, date_to):
     all_postings = []
     while True:
         try:
-            response = await api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload, method='POST')
+            response = api_request_with_retry(OZON_POSTING_FBO_URL, headers, payload, method='POST')
             data = response.json()
             postings = data.get("result", [])
             if not postings:
@@ -352,7 +365,7 @@ async def fetch_postings(date_from, date_to):
     save_to_cache(cache_key, all_postings)
     return all_postings
 
-async def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
+def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
     aggregated = {}
     for posting in postings:
         created_at = posting.get("created_at", "")
@@ -410,7 +423,7 @@ async def aggregate_postings(postings, date_from=None, date_to=None, time_limit=
     return aggregated
 
 # ---------- Функции для получения рекламных расходов (Performance) с разбивкой по месяцам ----------
-async def get_performance_token():
+def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
         return None
@@ -426,7 +439,7 @@ async def get_performance_token():
         "grant_type": "client_credentials"
     }
     try:
-        response = await api_request_with_retry(url, headers, payload, method='POST')
+        response = api_request_with_retry(url, headers, payload, method='POST')
         token_data = response.json()
         token = token_data.get("access_token")
         if token:
@@ -439,13 +452,13 @@ async def get_performance_token():
         write_log(f"❌ Ошибка при запросе токена: {e}")
         return None
 
-async def fetch_advertising_expense_single(date_from, date_to):
+def fetch_advertising_expense_single(date_from, date_to):
     cache_key = f"fetch_advertising_expense_single_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
     if cached is not None:
         return cached
 
-    token = await get_performance_token()
+    token = get_performance_token()
     if not token:
         return 0.0
 
@@ -459,7 +472,7 @@ async def fetch_advertising_expense_single(date_from, date_to):
         "dateTo": date_to,
     }
     try:
-        response = await api_request_with_retry(url, headers, params, method='GET')
+        response = api_request_with_retry(url, headers, params, method='GET')
         data = response.json()
         total_expense = 0.0
         if isinstance(data, dict) and "rows" in data:
@@ -483,7 +496,7 @@ async def fetch_advertising_expense_single(date_from, date_to):
         write_log(f"❌ Ошибка получения рекламных расходов: {e}")
         return 0.0
 
-async def fetch_advertising_expense(date_from, date_to):
+def fetch_advertising_expense(date_from, date_to):
     # Добавляем кэширование для всего периода (Шаг 1)
     cache_key = f"fetch_advertising_expense_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
@@ -500,7 +513,7 @@ async def fetch_advertising_expense(date_from, date_to):
 
     delta = (end_dt - start_dt).days
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        result = await fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
         save_to_cache(cache_key, result)
         return result
 
@@ -515,14 +528,14 @@ async def fetch_advertising_expense(date_from, date_to):
         if current.date() > today:
             break
         write_log(f"📊 Запрос рекламы за {month_start}–{month_end}")
-        total += await fetch_advertising_expense_single(month_start, month_end)
+        total += fetch_advertising_expense_single(month_start, month_end)
         current = current.replace(day=28) + datetime.timedelta(days=4)
         current = current.replace(day=1)
     save_to_cache(cache_key, total)
     return total
 
 # ---------- Функции для финансовых транзакций с разбивкой по месяцам ----------
-async def fetch_finance_transactions_single(date_from, date_to):
+def fetch_finance_transactions_single(date_from, date_to):
     cache_key = f"fetch_finance_transactions_single_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
     if cached is not None:
@@ -560,7 +573,7 @@ async def fetch_finance_transactions_single(date_from, date_to):
         }
 
         try:
-            response = await api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
+            response = api_request_with_retry(OZON_FINANCE_URL, headers, payload, method='POST')
             data = response.json()
             items = data.get("result", {}).get("operations", [])
             if not items:
@@ -577,7 +590,7 @@ async def fetch_finance_transactions_single(date_from, date_to):
     save_to_cache(cache_key, all_transactions)
     return all_transactions
 
-async def fetch_finance_transactions(date_from, date_to):
+def fetch_finance_transactions(date_from, date_to):
     # Добавляем кэширование для всего периода (Шаг 1)
     cache_key = f"fetch_finance_transactions_{date_from}_{date_to}"
     cached = get_from_cache(cache_key)
@@ -594,7 +607,7 @@ async def fetch_finance_transactions(date_from, date_to):
 
     delta = (end_dt - start_dt).days
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        result = await fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
         save_to_cache(cache_key, result)
         return result
 
@@ -609,7 +622,7 @@ async def fetch_finance_transactions(date_from, date_to):
         if current.date() > today:
             break
         write_log(f"💰 Запрос финансов за {month_start}–{month_end}")
-        all_transactions.extend(await fetch_finance_transactions_single(month_start, month_end))
+        all_transactions.extend(fetch_finance_transactions_single(month_start, month_end))
         current = current.replace(day=28) + datetime.timedelta(days=4)
         current = current.replace(day=1)
 
@@ -618,7 +631,7 @@ async def fetch_finance_transactions(date_from, date_to):
     return all_transactions
 
 # ---------- АГРЕГАЦИЯ ФИНАНСОВЫХ РАСХОДОВ (без доходов) ----------
-async def aggregate_finance_expenses(transactions):
+def aggregate_finance_expenses(transactions):
     # Оптимизация: сбор примеров без логирования внутри цикла (Шаг 3)
     expense_by_type = {}
     unique_types = set()
@@ -688,7 +701,7 @@ async def aggregate_finance_expenses(transactions):
     return expense_by_type
 
 # ---------- ФУНКЦИИ ДЛЯ ТОВАРНОЙ АНАЛИТИКИ (с offer_id) ----------
-async def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
+def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
     """Агрегирует данные по товарам за период, сохраняя offer_id"""
     product_stats = {}
     for posting in postings:
@@ -748,7 +761,7 @@ async def aggregate_products(postings, date_from=None, date_to=None, time_limit=
 
     return product_stats
 
-async def format_top_products(products, title, limit=15):
+def format_top_products(products, title, limit=15):
     """Формирует текстовый отчёт по товарам (без Markdown)"""
     if not products:
         return f"📦 {title}\n\n❌ Нет данных за указанный период."
@@ -790,13 +803,13 @@ def format_products_summary(products):
         f"  Средний чек: {avg_check:,.2f} ₽"
     )
 
-async def get_top_products_for_select(days=30):
+def get_top_products_for_select(days=30):
     """Возвращает топ-20 товаров за последние N дней с offer_id для выбора"""
     now = get_current_time_msk()
     end_date = now.date().isoformat()
     start_date = (now.date() - datetime.timedelta(days=days)).isoformat()
-    postings = await fetch_postings(start_date, end_date)
-    products = await aggregate_products(postings, date_from=start_date, date_to=end_date,
+    postings = fetch_postings(start_date, end_date)
+    products = aggregate_products(postings, date_from=start_date, date_to=end_date,
                                   time_limit=now.time(), apply_limit_on_day=end_date)
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:20]
     return [(sku, stats) for sku, stats in sorted_items]
@@ -812,7 +825,7 @@ def generate_product_chart_by_metric(sku, metric, years):
     for year in years:
         start_date = datetime.date(year, 1, 1).isoformat()
         end_date = datetime.date(year, 12, 31).isoformat()
-        postings = await fetch_postings(start_date, end_date)
+        postings = fetch_postings(start_date, end_date)
         monthly_data = {m: 0.0 for m in range(12)}
         order_counts = {m: 0 for m in range(12)}
         for posting in postings:
@@ -993,7 +1006,7 @@ def fetch_metrics_parallel(date_from, date_to):
 def fetch_metrics_for_period_parallel(date_from, date_to):
     """Обёртка для получения агрегированных метрик с параллельными запросами."""
     postings, ad_expense, transactions = fetch_metrics_parallel(date_from, date_to)
-    agg = await aggregate_postings(postings, date_from=date_from, date_to=date_to)
+    agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
     total = {
         "ordered_units": 0,
         "ordered_sum": 0.0,
@@ -1017,7 +1030,7 @@ def fetch_metrics_for_period_parallel(date_from, date_to):
     else:
         total["effective_drr"] = None
 
-    expenses = await aggregate_finance_expenses(transactions)
+    expenses = aggregate_finance_expenses(transactions)
     total["expenses"] = expenses
     return total
 
@@ -1025,7 +1038,7 @@ def fetch_metrics_for_period_parallel(date_from, date_to):
 def get_current_time_msk():
     return datetime.datetime.now(MOSCOW_TZ)
 
-async def format_combined_metrics_with_deltas(include_yesterday=False):
+def format_combined_metrics_with_deltas(include_yesterday=False):
     now = get_current_time_msk()
     today_date = now.date()
     current_time = now.time()
@@ -1051,19 +1064,19 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     # Используем параллельную загрузку для каждого периода отдельно, чтобы не смешивать
 
     # Загружаем данные для текущего месяца
-    postings_current = await fetch_postings(current_month_start_str, current_month_end_str)
+    postings_current = fetch_postings(current_month_start_str, current_month_end_str)
     # Загружаем данные для предыдущего месяца
-    postings_prev = await fetch_postings(previous_month_start_str, previous_month_end_str)
+    postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
     # Агрегация для вчера и сегодня с учётом времени
-    agg_yesterday_full = await aggregate_postings(
+    agg_yesterday_full = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
         date_to=yesterday_str
     )
     yesterday_full_metrics = agg_yesterday_full.get(yesterday_str, {}) if yesterday_str in agg_yesterday_full else {}
 
-    agg_today = await aggregate_postings(
+    agg_today = aggregate_postings(
         postings_current,
         date_from=today_str,
         date_to=today_str,
@@ -1072,7 +1085,7 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     today_metrics = agg_today.get(today_str, {}) if today_str in agg_today else {}
 
-    agg_yesterday = await aggregate_postings(
+    agg_yesterday = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
         date_to=yesterday_str,
@@ -1081,7 +1094,7 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     )
     yesterday_metrics = agg_yesterday.get(yesterday_str, {}) if yesterday_str in agg_yesterday else {}
 
-    agg_current_month = await aggregate_postings(
+    agg_current_month = aggregate_postings(
         postings_current,
         date_from=current_month_start_str,
         date_to=current_month_end_str,
@@ -1102,7 +1115,7 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
 
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_period_end_str = prev_period_end.isoformat()
-    agg_prev_month = await aggregate_postings(
+    agg_prev_month = aggregate_postings(
         postings_prev,
         date_from=previous_month_start_str,
         date_to=prev_period_end_str,
@@ -1137,8 +1150,8 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         fin_today = future_fin_today.result()
         fin_month = future_fin_month.result()
 
-    expenses_today = await aggregate_finance_expenses(fin_today)
-    expenses_month = await aggregate_finance_expenses(fin_month)
+    expenses_today = aggregate_finance_expenses(fin_today)
+    expenses_month = aggregate_finance_expenses(fin_month)
 
     # Добавляем рекламу в расходы
     if ad_today > 0:
@@ -1183,7 +1196,7 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
     d_ad_m = calc_delta(ad_month, ad_prev_period)
 
-    async def format_today_block():
+    def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
         canceled_sum = fmt_num(today_metrics.get("canceled_sum", 0))
@@ -1202,7 +1215,7 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
             f"    vs Вчера: \n  {delta_can_sum} ₽ / {delta_can_units} шт."
         )
 
-    async def format_month_block():
+    def format_month_block():
         ordered_sum = fmt_num(month_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(month_metrics.get("ordered_units", 0))
         delivered_sum = fmt_num(month_metrics.get("delivered_sum", 0))
@@ -1248,8 +1261,8 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         )
 
     parts = []
-    parts.append(await format_today_block())
-    parts.append(await format_month_block())
+    parts.append(format_today_block())
+    parts.append(format_month_block())
 
     parts.append(format_expense_block(expenses_today, "Расходы сегодня"))
     parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц"))
@@ -1260,8 +1273,8 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
 def get_monthly_delivered_sum(year):
     start_date = datetime.date(year, 1, 1).isoformat()
     end_date = datetime.date(year, 12, 31).isoformat()
-    postings = await fetch_postings(start_date, end_date)
-    daily_agg = await aggregate_postings(postings, date_from=start_date, date_to=end_date)
+    postings = fetch_postings(start_date, end_date)
+    daily_agg = aggregate_postings(postings, date_from=start_date, date_to=end_date)
     monthly = [0.0] * 12
     for date_str, vals in daily_agg.items():
         try:
@@ -1301,7 +1314,7 @@ def generate_sales_chart(years_list):
     return buf
 
 # ---------- ОСНОВНЫЕ ФУНКЦИИ ДЛЯ ОТЧЁТОВ (продажи) ----------
-async def format_single_metrics(metrics, title):
+def format_single_metrics(metrics, title):
     if not metrics:
         return f"📊 *{title}*\n\n❌ Нет данных за указанный период."
     has_data = False
@@ -1341,7 +1354,7 @@ async def format_single_metrics(metrics, title):
 
     return main_text
 
-async def get_metrics_for_date(date_str):
+def get_metrics_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
@@ -1354,7 +1367,7 @@ async def get_metrics_for_date(date_str):
         ad_expense = future_ad.result()
         transactions = future_fin.result()
 
-    agg = await aggregate_postings(postings, date_from=date_str, date_to=date_str)
+    agg = aggregate_postings(postings, date_from=date_str, date_to=date_str)
     metrics = agg.get(date_str, {})
     metrics["ad_expense"] = ad_expense if ad_expense is not None else 0.0
     revenue = metrics.get("ordered_sum", 0)
@@ -1368,47 +1381,47 @@ async def get_metrics_for_date(date_str):
     else:
         metrics["effective_drr"] = None
 
-    expenses = await aggregate_finance_expenses(transactions)
+    expenses = aggregate_finance_expenses(transactions)
     metrics["expenses"] = expenses
     return metrics
 
-async def get_metrics_for_period(date_from, date_to):
+def get_metrics_for_period(date_from, date_to):
     # Используем параллельную версию
     return fetch_metrics_for_period_parallel(date_from, date_to)
 
 # ---------- ТОВАРНЫЕ ОТЧЁТЫ ----------
-async def get_product_data_for_date(date_str):
+def get_product_data_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
-    postings = await fetch_postings(start, end)
-    products = await aggregate_products(postings, date_from=date_str, date_to=date_str)
+    postings = fetch_postings(start, end)
+    products = aggregate_products(postings, date_from=date_str, date_to=date_str)
     return products
 
-async def get_product_data_for_period(date_from, date_to):
-    postings = await fetch_postings(date_from, date_to)
-    products = await aggregate_products(postings, date_from=date_from, date_to=date_to)
+def get_product_data_for_period(date_from, date_to):
+    postings = fetch_postings(date_from, date_to)
+    products = aggregate_products(postings, date_from=date_from, date_to=date_to)
     return products
 
-async def get_product_data_today():
+def get_product_data_today():
     now = get_current_time_msk()
     today_str = now.date().isoformat()
-    postings = await fetch_postings(today_str, today_str)
-    products = await aggregate_products(postings, date_from=today_str, date_to=today_str,
+    postings = fetch_postings(today_str, today_str)
+    products = aggregate_products(postings, date_from=today_str, date_to=today_str,
                                   time_limit=now.time(), apply_limit_on_day=today_str)
     return products
 
-async def get_product_data_month():
+def get_product_data_month():
     now = get_current_time_msk()
     today_date = now.date()
     current_month_start = today_date.replace(day=1).isoformat()
     today_str = today_date.isoformat()
-    postings = await fetch_postings(current_month_start, today_str)
-    products = await aggregate_products(postings, date_from=current_month_start, date_to=today_str,
+    postings = fetch_postings(current_month_start, today_str)
+    products = aggregate_products(postings, date_from=current_month_start, date_to=today_str,
                                   time_limit=now.time(), apply_limit_on_day=today_str)
     return products
 
-async def get_product_data_prev_month():
+def get_product_data_prev_month():
     now = get_current_time_msk()
     today_date = now.date()
     current_month_start = today_date.replace(day=1)
@@ -1417,20 +1430,20 @@ async def get_product_data_prev_month():
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_start_str = previous_month_start.isoformat()
     prev_end_str = prev_period_end.isoformat()
-    postings = await fetch_postings(prev_start_str, prev_end_str)
-    products = await aggregate_products(postings, date_from=prev_start_str, date_to=prev_end_str,
+    postings = fetch_postings(prev_start_str, prev_end_str)
+    products = aggregate_products(postings, date_from=prev_start_str, date_to=prev_end_str,
                                   time_limit=now.time(), apply_limit_on_day=prev_end_str)
     return products
 
-async def format_product_combined():
-    products_today = await get_product_data_today()
-    products_month = await get_product_data_month()
-    products_prev_month = await get_product_data_prev_month()
+def format_product_combined():
+    products_today = get_product_data_today()
+    products_month = get_product_data_month()
+    products_prev_month = get_product_data_prev_month()
 
     parts = []
-    parts.append(await format_top_products(products_today, "Топ товаров за сегодня", limit=15))
+    parts.append(format_top_products(products_today, "Топ товаров за сегодня", limit=15))
     parts.append("")
-    parts.append(await format_top_products(products_month, "Топ товаров за текущий месяц (аналог. период)", limit=15))
+    parts.append(format_top_products(products_month, "Топ товаров за текущий месяц (аналог. период)", limit=15))
     if products_prev_month:
         parts.append("")
         parts.append("Сравнение с предыдущим месяцем (аналог. период)")
@@ -1457,8 +1470,8 @@ async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYP
     today_date = now.date()
     month_start = today_date.replace(day=1).isoformat()
     today_str = today_date.isoformat()
-    postings = await fetch_postings(month_start, today_str)
-    products = await aggregate_products(postings, date_from=month_start, date_to=today_str,
+    postings = fetch_postings(month_start, today_str)
+    products = aggregate_products(postings, date_from=month_start, date_to=today_str,
                                   time_limit=now.time(), apply_limit_on_day=today_str)
 
     if not products:
@@ -1645,7 +1658,7 @@ async def handle_sales_reports(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if text == "📅 Продажи за сегодня":
-        report = await format_combined_metrics_with_deltas(include_yesterday=False)
+        report = format_combined_metrics_with_deltas(include_yesterday=False)
         await update.message.reply_text(report, parse_mode="Markdown")
     elif text == "📆 Выбрать дату":
         now = get_moscow_today()
@@ -1698,7 +1711,7 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if text == "📅 Топ товаров за сегодня":
-        report = await format_product_combined()
+        report = format_product_combined()
         await update.message.reply_text(report)
     elif text == "📆 Выбрать дату (товары)":
         now = get_moscow_today()
@@ -1718,7 +1731,7 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
     elif text == "📈 Динамика по товару":
         # Показываем список товаров в формате "SKU Наименование Артикул"
         await update.message.reply_text("⏳ Загружаю список товаров за последние 30 дней...")
-        top_products = await get_top_products_for_select(days=30)
+        top_products = get_top_products_for_select(days=30)
         if not top_products:
             await update.message.reply_text("❌ Нет данных о товарах за последние 30 дней.")
             return ConversationHandler.END
@@ -2146,8 +2159,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if not valid:
                 await query.edit_message_text(result)
                 return WAITING_DATE_SINGLE
-            metrics = await get_metrics_for_date(date_str)
-            msg = await format_single_metrics(metrics, f"Продажи за {date_str}")
+            metrics = get_metrics_for_date(date_str)
+            msg = format_single_metrics(metrics, f"Продажи за {date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
             await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
             return ConversationHandler.END
@@ -2209,8 +2222,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         year = int(data.split("_")[-1])
         first_day = datetime.date(year, 1, 1)
         last_day = datetime.date(year, 12, 31)
-        metrics = await get_metrics_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
-        msg = await format_single_metrics(metrics, f"Продажи за {year} год")
+        metrics = get_metrics_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
+        msg = format_single_metrics(metrics, f"Продажи за {year} год")
         await query.edit_message_text(msg, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
@@ -2224,8 +2237,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        metrics = await get_metrics_for_period(date_from, date_to)
-        msg = await format_single_metrics(metrics, f"Продажи за {first_day.strftime('%B %Y')}")
+        metrics = get_metrics_for_period(date_from, date_to)
+        msg = format_single_metrics(metrics, f"Продажи за {first_day.strftime('%B %Y')}")
         await query.edit_message_text(msg, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
@@ -2241,8 +2254,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        metrics = await get_metrics_for_period(date_from, date_to)
-        msg = await format_single_metrics(metrics, f"Продажи за {q} квартал {year}")
+        metrics = get_metrics_for_period(date_from, date_to)
+        msg = format_single_metrics(metrics, f"Продажи за {q} квартал {year}")
         await query.edit_message_text(msg, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
@@ -2328,8 +2341,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 keyboard = create_calendar(now.year, now.month, "start_")
                 await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
                 return WAITING_PERIOD_START
-            metrics = await get_metrics_for_period(start_date, end_date_str)
-            msg = await format_single_metrics(metrics, f"Продажи за период {start_date} – {end_date_str}")
+            metrics = get_metrics_for_period(start_date, end_date_str)
+            msg = format_single_metrics(metrics, f"Продажи за период {start_date} – {end_date_str}")
             await query.edit_message_text(msg, parse_mode="Markdown")
             await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
             context.user_data.pop('period_start_date', None)
@@ -2410,8 +2423,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if not valid:
                 await query.edit_message_text(result)
                 return WAITING_PRODUCT_DATE
-            products = await get_product_data_for_date(date_str)
-            msg = await format_top_products(products, f"Товары за {date_str}", limit=20)
+            products = get_product_data_for_date(date_str)
+            msg = format_top_products(products, f"Товары за {date_str}", limit=20)
             summary = format_products_summary(products)
             await query.edit_message_text(msg + "\n\n" + summary)
             await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
@@ -2474,8 +2487,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         year = int(data.split("_")[-1])
         first_day = datetime.date(year, 1, 1)
         last_day = datetime.date(year, 12, 31)
-        products = await get_product_data_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
-        msg = await format_top_products(products, f"Товары за {year} год", limit=20)
+        products = get_product_data_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
+        msg = format_top_products(products, f"Товары за {year} год", limit=20)
         summary = format_products_summary(products)
         await query.edit_message_text(msg + "\n\n" + summary)
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
@@ -2490,8 +2503,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        products = await get_product_data_for_period(date_from, date_to)
-        msg = await format_top_products(products, f"Товары за {first_day.strftime('%B %Y')}", limit=20)
+        products = get_product_data_for_period(date_from, date_to)
+        msg = format_top_products(products, f"Товары за {first_day.strftime('%B %Y')}", limit=20)
         summary = format_products_summary(products)
         await query.edit_message_text(msg + "\n\n" + summary)
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
@@ -2508,8 +2521,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        products = await get_product_data_for_period(date_from, date_to)
-        msg = await format_top_products(products, f"Товары за {q} квартал {year}", limit=20)
+        products = get_product_data_for_period(date_from, date_to)
+        msg = format_top_products(products, f"Товары за {q} квартал {year}", limit=20)
         summary = format_products_summary(products)
         await query.edit_message_text(msg + "\n\n" + summary)
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
@@ -2596,8 +2609,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
                 keyboard = create_calendar(now.year, now.month, "pstart_")
                 await query.message.reply_text("Выберите начальную дату заново:", reply_markup=keyboard)
                 return WAITING_PRODUCT_PERIOD_START
-            products = await get_product_data_for_period(start_date, end_date_str)
-            msg = await format_top_products(products, f"Товары за период {start_date} – {end_date_str}", limit=20)
+            products = get_product_data_for_period(start_date, end_date_str)
+            msg = format_top_products(products, f"Товары за период {start_date} – {end_date_str}", limit=20)
             summary = format_products_summary(products)
             await query.edit_message_text(msg + "\n\n" + summary)
             await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
@@ -2852,7 +2865,7 @@ async def scheduled_report(context):
     if hour not in (10, 22):
         return
     include_yesterday = (hour == 10)
-    report = await format_combined_metrics_with_deltas(include_yesterday=include_yesterday)
+    report = format_combined_metrics_with_deltas(include_yesterday=include_yesterday)
     managers = load_managers()
     if not managers:
         return
