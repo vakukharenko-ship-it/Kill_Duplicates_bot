@@ -349,10 +349,8 @@ def fetch_advertising_expense(date_from, date_to):
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d")
     end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d")
     today = get_moscow_today()
-    # Если дата начала позже сегодня – пропускаем
     if start_dt.date() > today:
         return 0.0
-    # Обрезаем конечную дату до сегодня, если она в будущем
     if end_dt.date() > today:
         end_dt = datetime.datetime.combine(today, datetime.time(23, 59, 59))
 
@@ -476,8 +474,8 @@ def fetch_finance_transactions(date_from, date_to):
 def aggregate_finance_expenses(transactions):
     """
     Возвращает кортеж: (expense_by_type, income_by_type)
-    expense_by_type: {категория: сумма_расхода} для amount < 0
-    income_by_type: {категория: сумма_дохода} для amount > 0
+    expense_by_type: {категория: сумма_расхода} для amount < 0 и отрицательных accruals_for_sale и др.
+    income_by_type: {категория: сумма_дохода} для amount > 0 и положительных accruals_for_sale и др.
     """
     expense_by_type = {}
     income_by_type = {}
@@ -488,25 +486,38 @@ def aggregate_finance_expenses(transactions):
         if sample_count < 10:
             services = t.get("services", [])
             if services:
-                write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, services={json.dumps(services, ensure_ascii=False)}")
+                write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, accruals_for_sale={t.get('accruals_for_sale')}, services={json.dumps(services, ensure_ascii=False)}")
                 sample_count += 1
 
+        # 1. Комиссия (всегда расход)
         sale_comm = t.get("sale_commission", 0)
         if sale_comm < 0:
             expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
 
+        # 2. Начисления за продажу (выручка)
+        accruals = t.get("accruals_for_sale", 0)
+        if accruals > 0:
+            # Это выручка (доход)
+            income_by_type["Выручка"] = income_by_type.get("Выручка", 0) + accruals
+        elif accruals < 0:
+            # Возврат выручки (расход)
+            expense_by_type["Возврат выручки"] = expense_by_type.get("Возврат выручки", 0) + abs(accruals)
+
+        # 3. Доставка
         delivery_charge = t.get("delivery_charge", 0)
         if delivery_charge < 0:
             expense_by_type["Доставка (отдельно)"] = expense_by_type.get("Доставка (отдельно)", 0) + abs(delivery_charge)
         elif delivery_charge > 0:
             income_by_type["Доставка (отдельно)"] = income_by_type.get("Доставка (отдельно)", 0) + delivery_charge
 
+        # 4. Возвратная доставка
         return_delivery = t.get("return_delivery_charge", 0)
         if return_delivery < 0:
             expense_by_type["Возвратная доставка"] = expense_by_type.get("Возвратная доставка", 0) + abs(return_delivery)
         elif return_delivery > 0:
             income_by_type["Возвратная доставка"] = income_by_type.get("Возвратная доставка", 0) + return_delivery
 
+        # 5. Основной amount и services
         amount = t.get("amount", 0)
         op_type = t.get("operation_type_name", "Неизвестный тип")
         if amount < 0:
@@ -530,6 +541,7 @@ def aggregate_finance_expenses(transactions):
                 elif service_amount > 0:
                     has_positive_service = True
                     income_by_type[service_name] = income_by_type.get(service_name, 0) + service_amount
+            # Если в services не было отрицательных, но amount отрицательный, то добавим op_type
             if not has_negative_service and amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
             if not has_positive_service and amount > 0:
@@ -572,7 +584,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "Подписка Управление отзывами": "Подписка",
         "Оплата за клик": "Оплата за клик",
         "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
-        # Технические имена из services (добавляем все, что встречались)
+        # Технические имена из services
         "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
         "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
         "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
@@ -610,6 +622,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "Программы партнёров": "Программы партнёров",
         "Баллы за скидки": "Баллы за скидки",
         "Выручка": "Выручка",
+        "Возврат выручки": "Возврат выручки",
     }
 
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
@@ -647,7 +660,6 @@ def format_income_block(income_by_type, title, previous_incomes=None):
     total = sum(income_by_type.values())
     lines = [f"🔹 *{title}*", f"  *Итого доходов:* {total:,.2f} ₽"]
 
-    # Используем тот же словарь, что и для расходов (он уже полный)
     name_map = {
         "Комиссия Ozon": "Комиссия",
         "Оплата эквайринга": "Эквайринг",
@@ -696,6 +708,7 @@ def format_income_block(income_by_type, title, previous_incomes=None):
         "Программы партнёров": "Программы партнёров",
         "Баллы за скидки": "Баллы за скидки",
         "Выручка": "Выручка",
+        "Возврат выручки": "Возврат выручки",
     }
 
     sorted_items = sorted(income_by_type.items(), key=lambda x: x[1], reverse=True)
@@ -972,7 +985,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     parts.append(format_today_block())
     parts.append(format_month_block())
 
-    # Блоки расходов и доходов
     parts.append(format_expense_block(expenses_today, "Расходы сегодня", expenses_yesterday))
     parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц (аналог. период)", expenses_prev_month))
     parts.append(format_income_block(incomes_today, "Доходы сегодня", incomes_yesterday))
