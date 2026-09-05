@@ -714,6 +714,80 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(help_text, parse_mode='HTML')
 
+async def sales_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для 'Отчет по продажам'"""
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ У вас нет доступа")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "📊 <b>ОТЧЕТ ПО ПРОДАЖАМ</b>\n\n"
+        "⏳ Эта функция интегрируется с Ozon API.\n"
+        "Пока доступны следующие команды:\n\n"
+        "• <b>💰 Рентабельность</b> – анализ прибыли и ROI\n"
+        "• <b>📈 Анализ товара</b> – детальные данные по товарам\n"
+        "• <b>📦 Остатки</b> – текущее состояние запасов\n\n"
+        "Пожалуйста, используйте эти команды для анализа.",
+        parse_mode='HTML'
+    )
+    
+    keyboard = [
+        [KeyboardButton("📊 Отчет по продажам"), KeyboardButton("📦 Отчет по товарам")],
+        [KeyboardButton("⚙️ Администрирование"), KeyboardButton("ℹ️ Справка")],
+        [KeyboardButton("➕ Добавить поставку"), KeyboardButton("📦 Остатки")],
+        [KeyboardButton("💰 Рентабельность"), KeyboardButton("📈 Анализ товара")]
+    ]
+    await update.message.reply_text("Выберите действие:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return ConversationHandler.END
+
+async def products_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для 'Отчет по товарам'"""
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ У вас нет доступа")
+        return ConversationHandler.END
+    
+    await update.message.reply_text(
+        "📦 <b>ОТЧЕТ ПО ТОВАРАМ</b>\n\n"
+        "⏳ Эта функция интегрируется с Ozon API.\n"
+        "Пока доступны следующие команды:\n\n"
+        "• <b>📈 Анализ товара</b> – детальный анализ по каждому товару\n"
+        "• <b>📦 Остатки</b> – сколько товара на складе и его стоимость\n"
+        "• <b>💰 Рентабельность</b> – прибыльность каждого товара\n\n"
+        "Пожалуйста, используйте эти команды для просмотра данных по товарам.",
+        parse_mode='HTML'
+    )
+    
+    keyboard = [
+        [KeyboardButton("📊 Отчет по продажам"), KeyboardButton("📦 Отчет по товарам")],
+        [KeyboardButton("⚙️ Администрирование"), KeyboardButton("ℹ️ Справка")],
+        [KeyboardButton("➕ Добавить поставку"), KeyboardButton("📦 Остатки")],
+        [KeyboardButton("💰 Рентабельность"), KeyboardButton("📈 Анализ товара")]
+    ]
+    await update.message.reply_text("Выберите действие:", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
+    return ConversationHandler.END
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для 'Администрирование'"""
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("❌ Только администраторы имеют доступ к этому разделу")
+        return ConversationHandler.END
+    
+    keyboard = [
+        [KeyboardButton("📋 Список менеджеров"), KeyboardButton("➕ Добавить менеджера")],
+        [KeyboardButton("❌ Удалить менеджера"), KeyboardButton("◀️ Назад")]
+    ]
+    
+    await update.message.reply_text(
+        "⚙️ <b>АДМИНИСТРИРОВАНИЕ</b>\n\n"
+        "Выберите действие:",
+        parse_mode='HTML',
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    )
+    return ConversationHandler.END
+
 # ==================== FIFO ОБРАБОТЧИКИ ====================
 
 async def add_purchase_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1043,6 +1117,11 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.Regex("^ℹ️ Справка$"), help_command))
+    
+    # Основные меню команды
+    application.add_handler(MessageHandler(filters.Regex("^📊 Отчет по продажам$"), sales_report_command))
+    application.add_handler(MessageHandler(filters.Regex("^📦 Отчет по товарам$"), products_report_command))
+    application.add_handler(MessageHandler(filters.Regex("^⚙️ Администрирование$"), admin_command))
     
     # FIFO обработчики
     add_purchase_handler = ConversationHandler(
