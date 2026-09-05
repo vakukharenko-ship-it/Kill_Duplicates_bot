@@ -12,7 +12,8 @@ from telegram.ext import (
     filters, ConversationHandler, CallbackQueryHandler
 )
 from telegram.warnings import PTBUserWarning
-from telegram.helpers import escape_markdown  # Добавлен импорт
+from telegram.helpers import escape_markdown
+
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # Графики
@@ -579,7 +580,7 @@ def aggregate_finance_expenses(transactions):
 
     return expense_by_type
 
-# ---------- ФУНКЦИИ ДЛЯ ТОВАРНОЙ АНАЛИТИКИ ----------
+# ---------- ФУНКЦИИ ДЛЯ ТОВАРНОЙ АНАЛИТИКИ (без Markdown) ----------
 def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
     """Агрегирует данные по товарам за период"""
     product_stats = {}
@@ -639,14 +640,14 @@ def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, 
     return product_stats
 
 def format_top_products(products, title, limit=15):
+    """Формирует текстовый отчёт по товарам (без Markdown)"""
     if not products:
-        return f"📦 *{title}*\n\n❌ Нет данных за указанный период."
+        return f"📦 {title}\n\n❌ Нет данных за указанный период."
 
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:limit]
-    lines = [f"📦 *{title}*", ""]
+    lines = [f"📦 {title}", ""]
     for idx, (sku, stats) in enumerate(sorted_items, 1):
-        # Экранируем название товара для Markdown
-        name = escape_markdown(stats["name"][:40], version=2)
+        name = stats["name"][:40]
         ordered_sum = f"{stats['ordered_sum']:,.2f}".replace(",", " ")
         ordered_units = stats["ordered_units"]
         delivered_sum = f"{stats['delivered_sum']:,.2f}".replace(",", " ")
@@ -655,7 +656,7 @@ def format_top_products(products, title, limit=15):
         canceled_units = stats["canceled_units"]
         avg_check = (stats["ordered_sum"] / stats["order_count"]) if stats["order_count"] > 0 else 0
         avg_check_str = f"{avg_check:,.2f}".replace(",", " ")
-        lines.append(f"🏷 *{idx}. {name}*")
+        lines.append(f"{idx}. {name}")
         lines.append(f"   SKU: {sku}")
         lines.append(f"   🛒 Заказано: {ordered_sum} ₽ / {ordered_units} шт.")
         lines.append(f"   📦 Доставлено: {delivered_sum} ₽ / {delivered_units} шт.")
@@ -665,6 +666,7 @@ def format_top_products(products, title, limit=15):
     return "\n".join(lines)
 
 def format_products_summary(products):
+    """Формирует сводку по товарам (без Markdown)"""
     if not products:
         return "Нет данных"
     total_revenue = sum(p["ordered_sum"] for p in products.values())
@@ -672,7 +674,7 @@ def format_products_summary(products):
     total_orders = sum(p["order_count"] for p in products.values())
     avg_check = (total_revenue / total_orders) if total_orders > 0 else 0
     return (
-        f"📊 *Сводка*\n"
+        f"Сводка\n"
         f"  Уникальных товаров: {len(products)}\n"
         f"  Общая выручка: {total_revenue:,.2f} ₽\n"
         f"  Всего единиц: {total_units}\n"
@@ -739,7 +741,7 @@ def generate_product_chart(sku, year, product_name):
     plt.close(fig)
     return buf
 
-# ---------- ФОРМАТИРОВАНИЕ БЛОКОВ ----------
+# ---------- ФОРМАТИРОВАНИЕ БЛОКОВ (продажи – с Markdown) ----------
 def format_expense_block(expenses_by_type, title):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
@@ -1234,8 +1236,7 @@ def format_product_combined():
     parts.append(format_top_products(products_month, "Топ товаров за текущий месяц (аналог. период)", limit=15))
     if products_prev_month:
         parts.append("")
-        parts.append("📊 *Сравнение с предыдущим месяцем (аналог. период)*")
-        # Просто сравнение общего количества товаров и выручки
+        parts.append("Сравнение с предыдущим месяцем (аналог. период)")
         total_rev_current = sum(p["ordered_sum"] for p in products_month.values())
         total_rev_prev = sum(p["ordered_sum"] for p in products_prev_month.values())
         total_units_current = sum(p["ordered_units"] for p in products_month.values())
@@ -1245,7 +1246,7 @@ def format_product_combined():
         parts.append(f"  Выручка: {total_rev_current:,.2f} ₽ vs {total_rev_prev:,.2f} ₽ (Δ {delta_rev:.1f}%)" if delta_rev is not None else "  Выручка: нет данных")
         parts.append(f"  Единиц: {total_units_current} vs {total_units_prev} (Δ {delta_units:.1f}%)" if delta_units is not None else "  Единиц: нет данных")
 
-    return "📦 *Отчёт по товарам*\n\n\n" + "\n\n".join(parts)
+    return "📦 Отчёт по товарам\n\n\n" + "\n\n".join(parts)
 
 # ---------- КЛАВИАТУРЫ ----------
 def main_admin_keyboard():
@@ -1465,7 +1466,8 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
 
     if text == "📅 Топ товаров за сегодня":
         report = format_product_combined()
-        await update.message.reply_text(report, parse_mode="Markdown")
+        # Отправляем как обычный текст (без Markdown)
+        await update.message.reply_text(report)
     elif text == "📆 Выбрать дату (товары)":
         now = get_moscow_today()
         keyboard = create_calendar(now.year, now.month, "pdate_")
@@ -1875,7 +1877,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
 
-    # ---------- ТОВАРНЫЕ ОТЧЁТЫ (inline) ----------
+    # ---------- ТОВАРНЫЕ ОТЧЁТЫ (inline) – без Markdown ----------
     if data.startswith("pdate_"):
         if data == "pdate_cancel":
             await query.edit_message_text("Выбор даты отменён.")
@@ -1905,7 +1907,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             products = get_product_data_for_date(date_str)
             msg = format_top_products(products, f"Товары за {date_str}", limit=20)
             summary = format_products_summary(products)
-            await query.edit_message_text(msg + "\n\n" + summary, parse_mode="Markdown")
+            # Отправляем без Markdown
+            await query.edit_message_text(msg + "\n\n" + summary)
             await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
             return ConversationHandler.END
         else:
@@ -1969,7 +1972,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         products = get_product_data_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
         msg = format_top_products(products, f"Товары за {year} год", limit=20)
         summary = format_products_summary(products)
-        await query.edit_message_text(msg + "\n\n" + summary, parse_mode="Markdown")
+        await query.edit_message_text(msg + "\n\n" + summary)
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
         return ConversationHandler.END
 
@@ -1985,7 +1988,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         products = get_product_data_for_period(date_from, date_to)
         msg = format_top_products(products, f"Товары за {first_day.strftime('%B %Y')}", limit=20)
         summary = format_products_summary(products)
-        await query.edit_message_text(msg + "\n\n" + summary, parse_mode="Markdown")
+        await query.edit_message_text(msg + "\n\n" + summary)
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
         return ConversationHandler.END
 
@@ -2003,7 +2006,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         products = get_product_data_for_period(date_from, date_to)
         msg = format_top_products(products, f"Товары за {q} квартал {year}", limit=20)
         summary = format_products_summary(products)
-        await query.edit_message_text(msg + "\n\n" + summary, parse_mode="Markdown")
+        await query.edit_message_text(msg + "\n\n" + summary)
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
         return ConversationHandler.END
 
@@ -2081,7 +2084,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             products = get_product_data_for_period(start_date, end_date_str)
             msg = format_top_products(products, f"Товары за период {start_date} – {end_date_str}", limit=20)
             summary = format_products_summary(products)
-            await query.edit_message_text(msg + "\n\n" + summary, parse_mode="Markdown")
+            await query.edit_message_text(msg + "\n\n" + summary)
             await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
             context.user_data.pop('p_start_date', None)
             return ConversationHandler.END
