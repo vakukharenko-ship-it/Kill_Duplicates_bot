@@ -12,6 +12,7 @@ from telegram.ext import (
     filters, ConversationHandler, CallbackQueryHandler
 )
 from telegram.warnings import PTBUserWarning
+from telegram.helpers import escape_markdown  # Добавлен импорт
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # Графики
@@ -644,8 +645,8 @@ def format_top_products(products, title, limit=15):
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:limit]
     lines = [f"📦 *{title}*", ""]
     for idx, (sku, stats) in enumerate(sorted_items, 1):
-        # Экранируем спецсимволы Markdown в названии товара
-        name = stats["name"][:40].replace("*", "\\*").replace("_", "\\_")
+        # Экранируем название товара для Markdown
+        name = escape_markdown(stats["name"][:40], version=2)
         ordered_sum = f"{stats['ordered_sum']:,.2f}".replace(",", " ")
         ordered_units = stats["ordered_units"]
         delivered_sum = f"{stats['delivered_sum']:,.2f}".replace(",", " ")
