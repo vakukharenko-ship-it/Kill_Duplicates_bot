@@ -607,7 +607,7 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
         "Баллы за скидки": "Баллы за скидки",
         "Выручка": "Выручка",
         "Возврат выручки": "Возврат выручки",
-        "Реклама": "Реклама",  # будет добавлена отдельно
+        "Реклама": "Реклама",
     }
 
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
@@ -627,7 +627,6 @@ def format_expense_block(expenses_by_type, title, previous_expenses=None):
                 write_log(f"⚠️ Не найдено соответствие для категории: {category}")
         lines.append(f"    {short_name}: {amount:,.2f} ₽")
 
-    # Удаляем строку "Изменение vs предыдущий"
     return "\n".join(lines)
 
 def format_income_block(income_by_type, title, previous_incomes=None):
@@ -812,7 +811,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     ad_month = fetch_advertising_expense(current_month_start_str, current_month_end_str)
     ad_prev_month = fetch_advertising_expense(previous_month_start_str, previous_month_end_str)
 
-    # Финансы: расходы и доходы (доходы пока не используем, но оставим для возможного расширения)
     expenses_today, incomes_today = aggregate_finance_expenses(fetch_finance_transactions(today_str, today_str))
     expenses_yesterday, incomes_yesterday = aggregate_finance_expenses(fetch_finance_transactions(yesterday_str, yesterday_str))
     expenses_month, incomes_month = aggregate_finance_expenses(fetch_finance_transactions(current_month_start_str, current_month_end_str))
@@ -821,7 +819,8 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     # Добавляем рекламу в расходы за месяц
     if ad_month > 0:
         expenses_month["Реклама"] = ad_month
-    # Также можно добавить в расходы за сегодня, если нужно, но не требуется
+    if ad_today > 0:
+        expenses_today["Реклама"] = ad_today
 
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
@@ -859,7 +858,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
     d_ad_m = calc_delta(ad_month, ad_prev_month)
 
-    # Для ДРР и ДРР дост за предыдущий месяц
     prev_revenue = prev_month_metrics.get("ordered_sum", 0)
     prev_delivered_revenue = prev_month_metrics.get("delivered_sum", 0)
     prev_drr = (ad_prev_month / prev_revenue * 100) if prev_revenue > 0 else None
@@ -899,7 +897,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         delivered_revenue = month_metrics.get("delivered_sum", 0)
         eff_drr = (ad_month / delivered_revenue * 100) if delivered_revenue > 0 else None
 
-        # Значения за предыдущий месяц для ДРР
         prev_rev = prev_month_metrics.get("ordered_sum", 0)
         prev_del_rev = prev_month_metrics.get("delivered_sum", 0)
         prev_drr_val = (ad_prev_month / prev_rev * 100) if prev_rev > 0 else None
@@ -916,7 +913,6 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
         delta_del_units_m = fmt_pct(d_del_units_m)
         delta_can_sum_m = fmt_pct(d_can_sum_m)
         delta_can_units_m = fmt_pct(d_can_units_m)
-        delta_ad_m = fmt_pct(d_ad_m)
 
         return (
             f"🔹 *Текущий месяц*\n"
@@ -935,11 +931,8 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     parts.append(format_today_block())
     parts.append(format_month_block())
 
-    # Блоки расходов (без динамики)
     parts.append(format_expense_block(expenses_today, "Расходы сегодня", None))
     parts.append(format_expense_block(expenses_month, "Расходы за текущий месяц", None))
-
-    # Доходы убраны
 
     return "📊 *Продажи за сегодня*\n\n\n" + "\n\n".join(parts)
 
@@ -1013,7 +1006,7 @@ def format_single_metrics(metrics, title):
         f"  Штук: {metrics.get('ordered_units', 0)}\n\n"
         f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
         f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
-        f"❌ *Отмены*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
+        f"❌ *Отменено*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
         f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
         f"📢 *Реклама*\n"
         f"  Расходы: {ad_expense:,.2f} ₽\n"
