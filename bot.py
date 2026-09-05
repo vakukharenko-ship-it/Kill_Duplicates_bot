@@ -39,9 +39,8 @@ _cache_timestamps = {}
 _http_session = None
 _rate_limiter = None
 
-# ==================== RATE LIMITER ====================
 class RateLimiter:
-    """Контроллер частоты запросов к Ozon API (2 req/sec)"""
+    """Контроль частоты запросов к Ozon API (лимит: 2 запроса в секунду)"""
     def __init__(self, rate_per_second):
         self.rate_per_second = rate_per_second
         self.min_interval = 1.0 / rate_per_second
@@ -49,31 +48,52 @@ class RateLimiter:
         self.lock = asyncio.Lock()
 
     async def acquire(self):
+        """Ожидает необходимое время для соблюдения rate limit"""
         async with self.lock:
-            loop = asyncio.get_event_loop()
-            now = loop.time()
+            try:
+                now = asyncio.get_running_loop().time()
+            except RuntimeError:
+                import time as time_module
+                now = time_module.time()
+
             time_since_last = now - self.last_call
             if time_since_last < self.min_interval:
                 await asyncio.sleep(self.min_interval - time_since_last)
-            self.last_call = loop.time()
+
+            try:
+                self.last_call = asyncio.get_running_loop().time()
+            except RuntimeError:
+                import time as time_module
+                self.last_call = time_module.time()
 
 async def init_http_session():
-    """Инициализация глобальной HTTP сессии"""
+    """Инициализация глобальной HTTP сессии с пулом соединений"""
     global _http_session, _rate_limiter
     if _http_session is None:
-        connector = aiohttp.TCPConnector(limit=50, limit_per_host=10, ttl_dns_cache=300)
+        # Настройки пула соединений для оптимальной производительности
+        connector = aiohttp.TCPConnector(
+            limit=50,              # Максимум 50 одновременных соединений
+            limit_per_host=10,     # Максимум 10 к одному хосту
+            ttl_dns_cache=300,     # DNS кеш на 5 минут
+        )
         timeout = aiohttp.ClientTimeout(total=15)
         _http_session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+
     if _rate_limiter is None:
-        _rate_limiter = RateLimiter(2.0)
+        _rate_limiter = RateLimiter(2.0)  # 2 запроса в секунду (лимит Ozon)
+
     return _http_session
 
 async def close_http_session():
-    """Закрытие HTTP сессии"""
+    """Закрытие HTTP сессии с обработкой ошибок"""
     global _http_session
     if _http_session:
-        await _http_session.close()
-        _http_session = None
+        try:
+            await _http_session.close()
+        except Exception as e:
+            write_log(f"⚠️ Ошибка при закрытии сессии: {e}")
+        finally:
+            _http_session = None
 
 
 def get_from_cache(key):
@@ -285,42 +305,27 @@ def validate_period(date_from, date_to):
 
 # ---------- Функции API с retry и кэшированием ----------
 async def api_request_with_retry(url, headers, payload=None, method='POST', timeout=API_TIMEOUT):
-    """Асинхронный HTTP запрос с retry логикой и rate limiting"""
-    session = await init_http_session()
-
     for attempt in range(API_RETRY_ATTEMPTS):
         try:
-            # Соблюдаем rate limit
-            await _rate_limiter.acquire()
-
             if method == 'POST':
-                async with session.post(url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-                    if response.status == 429:
-                        wait_time = API_RETRY_DELAY * (2 ** attempt)
-                        write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        continue
-
-                    response.raise_for_status()
-                    return await response.json()
+                response = requests.post(url, headers=headers, json=payload, timeout=timeout)
             else:
-                async with session.get(url, headers=headers, params=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-                    if response.status == 429:
-                        wait_time = API_RETRY_DELAY * (2 ** attempt)
-                        write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
-                        await asyncio.sleep(wait_time)
-                        continue
+                response = requests.get(url, headers=headers, params=payload, timeout=timeout)
 
-                    response.raise_for_status()
-                    return await response.json()
+            if response.status_code == 429:
+                wait_time = API_RETRY_DELAY * (2 ** attempt)
+                write_log(f"⚠️ Rate limit hit, waiting {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                continue
 
-        except aiohttp.ClientError as e:
+            response.raise_for_status()
+            return response
+
+        except requests.exceptions.RequestException as e:
             if attempt == API_RETRY_ATTEMPTS - 1:
                 raise
             write_log(f"⚠️ Request failed (attempt {attempt+1}/{API_RETRY_ATTEMPTS}): {e}")
             await asyncio.sleep(API_RETRY_DELAY)
-
-    raise Exception("All retry attempts failed")
 
 # ---------- Функции для получения данных Ozon (отгрузки) ----------
 async def fetch_postings(date_from, date_to):
@@ -453,7 +458,7 @@ async def fetch_advertising_expense_single(date_from, date_to):
     if cached is not None:
         return cached
 
-    token = await get_performance_token()
+    token = get_performance_token()
     if not token:
         return 0.0
 
@@ -508,7 +513,7 @@ async def fetch_advertising_expense(date_from, date_to):
 
     delta = (end_dt - start_dt).days
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        result = await fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = fetch_advertising_expense_single(date_from, end_dt.strftime("%Y-%m-%d"))
         save_to_cache(cache_key, result)
         return result
 
@@ -523,7 +528,7 @@ async def fetch_advertising_expense(date_from, date_to):
         if current.date() > today:
             break
         write_log(f"📊 Запрос рекламы за {month_start}–{month_end}")
-        total += await fetch_advertising_expense_single(month_start, month_end)
+        total += fetch_advertising_expense_single(month_start, month_end)
         current = current.replace(day=28) + datetime.timedelta(days=4)
         current = current.replace(day=1)
     save_to_cache(cache_key, total)
@@ -602,7 +607,7 @@ async def fetch_finance_transactions(date_from, date_to):
 
     delta = (end_dt - start_dt).days
     if delta <= API_MAX_DAYS_PER_REQUEST:
-        result = await fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
+        result = fetch_finance_transactions_single(date_from, end_dt.strftime("%Y-%m-%d"))
         save_to_cache(cache_key, result)
         return result
 
@@ -617,7 +622,7 @@ async def fetch_finance_transactions(date_from, date_to):
         if current.date() > today:
             break
         write_log(f"💰 Запрос финансов за {month_start}–{month_end}")
-        all_transactions.extend(await fetch_finance_transactions_single(month_start, month_end))
+        all_transactions.extend(fetch_finance_transactions_single(month_start, month_end))
         current = current.replace(day=28) + datetime.timedelta(days=4)
         current = current.replace(day=1)
 
@@ -803,7 +808,7 @@ def get_top_products_for_select(days=30):
     now = get_current_time_msk()
     end_date = now.date().isoformat()
     start_date = (now.date() - datetime.timedelta(days=days)).isoformat()
-    postings = await fetch_postings(start_date, end_date)
+    postings = fetch_postings(start_date, end_date)
     products = aggregate_products(postings, date_from=start_date, date_to=end_date,
                                   time_limit=now.time(), apply_limit_on_day=end_date)
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:20]
@@ -820,7 +825,7 @@ def generate_product_chart_by_metric(sku, metric, years):
     for year in years:
         start_date = datetime.date(year, 1, 1).isoformat()
         end_date = datetime.date(year, 12, 31).isoformat()
-        postings = await fetch_postings(start_date, end_date)
+        postings = fetch_postings(start_date, end_date)
         monthly_data = {m: 0.0 for m in range(12)}
         order_counts = {m: 0 for m in range(12)}
         for posting in postings:
@@ -1000,7 +1005,7 @@ async def fetch_metrics_parallel(date_from, date_to):
 
 async def fetch_metrics_for_period_parallel(date_from, date_to):
     """Обёртка для получения агрегированных метрик с параллельными запросами."""
-    postings, ad_expense, transactions = await fetch_metrics_parallel(date_from, date_to)
+    postings, ad_expense, transactions = fetch_metrics_parallel(date_from, date_to)
     agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
     total = {
         "ordered_units": 0,
@@ -1059,9 +1064,9 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
     # Используем параллельную загрузку для каждого периода отдельно, чтобы не смешивать
 
     # Загружаем данные для текущего месяца
-    postings_current = await fetch_postings(current_month_start_str, current_month_end_str)
+    postings_current = fetch_postings(current_month_start_str, current_month_end_str)
     # Загружаем данные для предыдущего месяца
-    postings_prev = await fetch_postings(previous_month_start_str, previous_month_end_str)
+    postings_prev = fetch_postings(previous_month_start_str, previous_month_end_str)
 
     # Агрегация для вчера и сегодня с учётом времени
     agg_yesterday_full = aggregate_postings(
@@ -1268,7 +1273,7 @@ def format_combined_metrics_with_deltas(include_yesterday=False):
 def get_monthly_delivered_sum(year):
     start_date = datetime.date(year, 1, 1).isoformat()
     end_date = datetime.date(year, 12, 31).isoformat()
-    postings = await fetch_postings(start_date, end_date)
+    postings = fetch_postings(start_date, end_date)
     daily_agg = aggregate_postings(postings, date_from=start_date, date_to=end_date)
     monthly = [0.0] * 12
     for date_str, vals in daily_agg.items():
@@ -1382,26 +1387,26 @@ def get_metrics_for_date(date_str):
 
 def get_metrics_for_period(date_from, date_to):
     # Используем параллельную версию
-    return await fetch_metrics_for_period_parallel(date_from, date_to)
+    return fetch_metrics_for_period_parallel(date_from, date_to)
 
 # ---------- ТОВАРНЫЕ ОТЧЁТЫ ----------
 def get_product_data_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
-    postings = await fetch_postings(start, end)
+    postings = fetch_postings(start, end)
     products = aggregate_products(postings, date_from=date_str, date_to=date_str)
     return products
 
 def get_product_data_for_period(date_from, date_to):
-    postings = await fetch_postings(date_from, date_to)
+    postings = fetch_postings(date_from, date_to)
     products = aggregate_products(postings, date_from=date_from, date_to=date_to)
     return products
 
 def get_product_data_today():
     now = get_current_time_msk()
     today_str = now.date().isoformat()
-    postings = await fetch_postings(today_str, today_str)
+    postings = fetch_postings(today_str, today_str)
     products = aggregate_products(postings, date_from=today_str, date_to=today_str,
                                   time_limit=now.time(), apply_limit_on_day=today_str)
     return products
@@ -1411,7 +1416,7 @@ def get_product_data_month():
     today_date = now.date()
     current_month_start = today_date.replace(day=1).isoformat()
     today_str = today_date.isoformat()
-    postings = await fetch_postings(current_month_start, today_str)
+    postings = fetch_postings(current_month_start, today_str)
     products = aggregate_products(postings, date_from=current_month_start, date_to=today_str,
                                   time_limit=now.time(), apply_limit_on_day=today_str)
     return products
@@ -1425,7 +1430,7 @@ def get_product_data_prev_month():
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_start_str = previous_month_start.isoformat()
     prev_end_str = prev_period_end.isoformat()
-    postings = await fetch_postings(prev_start_str, prev_end_str)
+    postings = fetch_postings(prev_start_str, prev_end_str)
     products = aggregate_products(postings, date_from=prev_start_str, date_to=prev_end_str,
                                   time_limit=now.time(), apply_limit_on_day=prev_end_str)
     return products
@@ -1465,7 +1470,7 @@ async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYP
     today_date = now.date()
     month_start = today_date.replace(day=1).isoformat()
     today_str = today_date.isoformat()
-    postings = await fetch_postings(month_start, today_str)
+    postings = fetch_postings(month_start, today_str)
     products = aggregate_products(postings, date_from=month_start, date_to=today_str,
                                   time_limit=now.time(), apply_limit_on_day=today_str)
 
@@ -2871,4 +2876,4 @@ async def scheduled_report(context):
             write_log(f"Ошибка отправки {m['id']}: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
