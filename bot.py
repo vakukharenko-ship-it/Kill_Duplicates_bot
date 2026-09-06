@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.1.2"  # Прогресс-бары и интерактивные графики
+VERSION = "2.1.3"  # Исправлена ошибка редактирования сообщения с фото
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -484,70 +484,6 @@ async def close_http_session(app):
         await _http_session.close()
         write_log("🔒 HTTP-сессия закрыта.")
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ПРОГРЕССА ----------
-async def send_progress(update, message, progress=None):
-    """Отправляет или обновляет сообщение с прогрессом."""
-    if not update:
-        return
-    text = f"⏳ {message}"
-    if progress is not None:
-        # Создаём простой прогресс-бар из 10 символов
-        bar_len = 10
-        filled = int(progress / 100 * bar_len)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        text += f"\n[{bar}] {int(progress)}%"
-    # Если в user_data есть message_id прогресса, редактируем его
-    context = update.callback_query if hasattr(update, 'callback_query') else update
-    if hasattr(update, 'effective_chat'):
-        chat_id = update.effective_chat.id
-    else:
-        chat_id = update.message.chat_id if hasattr(update, 'message') else None
-    if not chat_id:
-        return
-    # Пытаемся найти сохранённый message_id
-    progress_msg_id = None
-    if hasattr(update, 'callback_query') and update.callback_query:
-        user_data = update.callback_query.message.chat.id
-    else:
-        user_data = update.message.chat.id
-    # Временно используем глобальный словарь для хранения id сообщений прогресса
-    # Для простоты будем просто отправлять новое сообщение и удалять предыдущее
-    # Но для экономии ресурсов будем хранить id в user_data, если есть доступ
-    try:
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.edit_text(text, parse_mode="HTML")
-        else:
-            sent = await update.message.reply_text(text, parse_mode="HTML")
-            # Сохраняем id для будущих обновлений
-            if update.effective_user:
-                context.user_data['progress_msg_id'] = sent.message_id
-    except Exception as e:
-        # Если не удалось отредактировать, отправляем новое
-        sent = await update.message.reply_text(text, parse_mode="HTML")
-        if update.effective_user:
-            context.user_data['progress_msg_id'] = sent.message_id
-
-async def finish_progress(update, message):
-    """Завершает прогресс, отправляя финальное сообщение и удаляя прогресс-бар."""
-    if not update:
-        return
-    chat_id = update.effective_chat.id
-    try:
-        # Удаляем сообщение прогресса, если есть
-        if hasattr(update, 'callback_query') and update.callback_query:
-            await update.callback_query.message.delete()
-        else:
-            # Пытаемся удалить по сохранённому id
-            if update.effective_user and 'progress_msg_id' in context.user_data:
-                try:
-                    await update.message.chat.delete_message(context.user_data['progress_msg_id'])
-                except:
-                    pass
-        # Отправляем финальное сообщение
-        await update.message.reply_text(f"✅ {message}", parse_mode="HTML")
-    except:
-        pass
-
 # ==================== ФУНКЦИИ API С RETRY И АСИНХРОННОСТЬЮ ====================
 async def api_request_with_retry(url, headers, payload=None, method='POST'):
     global _http_session, _rate_limiter
@@ -609,7 +545,7 @@ async def get_performance_token():
         write_log(f"❌ Ошибка при запросе токена: {e}")
         return None
 
-# ---------- ОТГРУЗКИ (с прогрессом) ----------
+# ---------- ОТГРУЗКИ ----------
 async def fetch_postings(date_from, date_to, progress_callback=None):
     cache_key = f"fetch_postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -639,7 +575,6 @@ async def fetch_postings(date_from, date_to, progress_callback=None):
             if not postings:
                 break
             all_postings.extend(postings)
-            # Если есть total, можно вычислить прогресс
             if total_pages is None and 'total' in data:
                 total_pages = (data['total'] + payload['limit'] - 1) // payload['limit']
             if progress_callback:
@@ -655,7 +590,7 @@ async def fetch_postings(date_from, date_to, progress_callback=None):
     await save_to_cache(cache_key, all_postings)
     return all_postings
 
-# ---------- РЕКЛАМНЫЕ РАСХОДЫ (с прогрессом) ----------
+# ---------- РЕКЛАМНЫЕ РАСХОДЫ ----------
 async def fetch_advertising_expense_single(date_from, date_to):
     cache_key = f"fetch_advertising_expense_single_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -746,7 +681,7 @@ async def fetch_advertising_expense(date_from, date_to, progress_callback=None):
         await progress_callback("Реклама загружена", 100)
     return total
 
-# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ (с прогрессом) ----------
+# ---------- ФИНАНСОВЫЕ ТРАНЗАКЦИИ ----------
 async def fetch_finance_transactions_single(date_from, date_to):
     cache_key = f"fetch_finance_transactions_single_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -949,15 +884,13 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
 
     return aggregated
 
-# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ С ПРОГРЕССОМ ----------
+# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ ----------
 async def fetch_metrics_parallel(date_from, date_to, progress_callback=None):
-    # Загружаем все три источника параллельно с общим прогрессом
     if progress_callback:
         await progress_callback("Начинаем загрузку данных...", 0)
     postings_task = fetch_postings(date_from, date_to)
     ad_task = fetch_advertising_expense(date_from, date_to)
     finance_task = fetch_finance_transactions(date_from, date_to)
-    # Запускаем все задачи
     postings, ad_expense, transactions = await asyncio.gather(
         postings_task, ad_task, finance_task
     )
@@ -1369,12 +1302,11 @@ def format_single_metrics(metrics, title):
 
     return main_text
 
-# ---------- АСИНХРОННЫЕ ФУНКЦИИ ДЛЯ ПОЛУЧЕНИЯ МЕТРИК С ПРОГРЕССОМ ----------
+# ---------- АСИНХРОННЫЕ ФУНКЦИИ ДЛЯ ПОЛУЧЕНИЯ МЕТРИК ----------
 async def get_metrics_for_date(date_str, progress_callback=None):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
-    # Для одной даты загружаем все данные параллельно с прогрессом
     postings_task = fetch_postings(start, end, progress_callback)
     ad_task = fetch_advertising_expense(date_str, date_str, progress_callback)
     fin_task = fetch_finance_transactions(date_str, date_str, progress_callback)
@@ -1924,7 +1856,6 @@ async def handle_sales_reports(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if text == "📅 Продажи за сегодня":
-        # Отправляем прогресс
         progress_msg = await update.message.reply_text("⏳ Загружаю данные за сегодня...")
         report = await format_combined_metrics_with_deltas(include_yesterday=False, progress_callback=None)
         await progress_msg.delete()
@@ -2247,7 +2178,8 @@ async def product_period_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⏳ Строю график...")
         chart_buf = await generate_product_chart_by_metric(sku, metric, [current_year])
         if chart_buf:
-            # Отправляем график с дополнительными кнопками
+            # Сохраняем год для переключения метрик
+            context.user_data['product_year'] = current_year
             caption = f"Динамика по товару (SKU: {sku}) за {current_year} год"
             keyboard = [
                 [InlineKeyboardButton("Другая метрика", callback_data=f"change_metric_{sku}")],
@@ -2284,7 +2216,9 @@ async def product_chart_interactive_callback(update: Update, context: ContextTyp
 
     if data.startswith("change_metric_"):
         sku = data.split("_")[-1]
-        # Показываем выбор метрики
+        # Удаляем сообщение с графиком
+        await query.message.delete()
+        # Показываем выбор метрики новым сообщением
         keyboard = [
             [InlineKeyboardButton("Заказано (₽)", callback_data=f"metric_ordered_sum")],
             [InlineKeyboardButton("Заказано (шт.)", callback_data=f"metric_ordered_units")],
@@ -2295,16 +2229,17 @@ async def product_chart_interactive_callback(update: Update, context: ContextTyp
             [InlineKeyboardButton("Средний чек (₽)", callback_data=f"metric_avg_check")],
             [InlineKeyboardButton("🔙 Назад", callback_data="product_chart_back")]
         ]
-        await query.edit_message_text(f"Выберите метрику для товара SKU:{sku}:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text(f"Выберите метрику для товара SKU:{sku}:", reply_markup=InlineKeyboardMarkup(keyboard))
         return WAITING_PRODUCT_METRIC
 
     if data.startswith("change_year_"):
         sku = data.split("_")[-1]
+        await query.message.delete()
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"year_{y}")] for y in years]
         buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="product_chart_back")])
-        await query.edit_message_text(f"Выберите год для товара SKU:{sku}:", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.message.reply_text(f"Выберите год для товара SKU:{sku}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PRODUCT_SINGLE_YEAR
 
     if data.startswith("year_"):
@@ -2312,11 +2247,15 @@ async def product_chart_interactive_callback(update: Update, context: ContextTyp
         sku = context.user_data.get('product_sku')
         metric = context.user_data.get('product_metric')
         if not sku or not metric:
-            await query.edit_message_text("❌ Ошибка: потеряны данные.")
+            await query.message.reply_text("❌ Ошибка: потеряны данные.")
             return ConversationHandler.END
-        await query.edit_message_text("⏳ Строю график...")
+        # Удаляем сообщение с выбором года
+        await query.message.delete()
+        progress_msg = await query.message.reply_text("⏳ Строю график...")
         chart_buf = await generate_product_chart_by_metric(sku, metric, [year])
+        await progress_msg.delete()
         if chart_buf:
+            context.user_data['product_year'] = year
             caption = f"Динамика по товару (SKU: {sku}) за {year} год"
             keyboard = [
                 [InlineKeyboardButton("Другая метрика", callback_data=f"change_metric_{sku}")],
@@ -2324,13 +2263,11 @@ async def product_chart_interactive_callback(update: Update, context: ContextTyp
                 [InlineKeyboardButton("🔙 Назад", callback_data="product_chart_back")]
             ]
             await query.message.reply_photo(photo=chart_buf, caption=caption, reply_markup=InlineKeyboardMarkup(keyboard))
-            await query.delete_message()
         else:
-            await query.edit_message_text("❌ Нет данных для построения графика.")
+            await query.message.reply_text("❌ Нет данных для построения графика.")
         return ConversationHandler.END
 
 async def product_year_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Перенаправляем на общий обработчик
     return await product_chart_interactive_callback(update, context)
 
 async def product_range_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2399,7 +2336,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Нет доступа! Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # Обработка для интерактивных графиков (добавлены новые callback'и)
+    # Обработка для интерактивных графиков
     if data.startswith("change_metric_") or data.startswith("change_year_") or data.startswith("year_") or data == "product_chart_back":
         return await product_chart_interactive_callback(update, context)
 
@@ -2434,7 +2371,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             if not valid:
                 await query.edit_message_text(result)
                 return WAITING_DATE_SINGLE
-            # Прогресс
             progress_msg = await query.message.reply_text("⏳ Загружаю данные...")
             metrics = await get_metrics_for_date(date_str, progress_callback=None)
             await progress_msg.delete()
