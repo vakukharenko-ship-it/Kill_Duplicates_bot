@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.7"  # Кнопки товара в 3 строки, убран ручной ввод SKU
+VERSION = "2.0.8"  # Кнопки товара однострочные, без переносов
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -97,7 +97,6 @@ WAITING_PRODUCT_PERIOD_CHOICE = 32
 WAITING_PRODUCT_SINGLE_YEAR = 33
 WAITING_PRODUCT_RANGE_START = 34
 WAITING_PRODUCT_RANGE_END = 35
-# WAITING_PRODUCT_SKU_MANUAL = 36  # УДАЛЕН
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -1672,19 +1671,16 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
         keyboard = []
         for idx, (sku, stats) in enumerate(top_products, 1):
             name = stats['name']  # полное название (до 60 символов уже обрезано)
-            # Разбиваем название на две строки по 30 символов
-            first_line = name[:30]
-            second_line = name[30:60] if len(name) > 30 else ""
-            # Формируем третью строку: SKU и ART (если есть)
+            # Сокращаем название до 25 символов, чтобы влезло в кнопку
+            short_name = name[:25] + "..." if len(name) > 25 else name
             offer_id = stats.get('offer_id', '')
+            # Формируем текст кнопки в одну строку
             if offer_id:
-                third_line = f"SKU: {sku}  ART: {offer_id}"
+                button_text = f"{short_name} (SKU:{sku} ART:{offer_id})"
             else:
-                third_line = f"SKU: {sku}"
-            # Собираем текст кнопки
-            button_text = f"{first_line}\n{second_line}\n{third_line}" if second_line else f"{first_line}\n\n{third_line}"
+                button_text = f"{short_name} (SKU:{sku})"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"prod_{sku}")])
-        # Добавляем только кнопку "Отмена" (без ручного ввода)
+        # Кнопка отмены
         keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="prod_cancel")])
         await update.message.reply_text(
             "Выберите товар, нажав на соответствующую кнопку:",
@@ -2723,7 +2719,6 @@ def main():
             WAITING_PRODUCT_SINGLE_YEAR: [CallbackQueryHandler(handle_callback_query)],
             WAITING_PRODUCT_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_start)],
             WAITING_PRODUCT_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_end)],
-            # WAITING_PRODUCT_SKU_MANUAL удалён
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
