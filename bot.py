@@ -16,7 +16,7 @@ from telegram.warnings import PTBUserWarning
 from telegram.helpers import escape_markdown
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.1"  # 🔄 Меняйте номер при каждом обновлении
+VERSION = "2.0.2"  # 🔄 Меняйте номер при каждом обновлении
 
 # Графики
 import matplotlib.pyplot as plt
@@ -267,7 +267,7 @@ class RateLimiter:
             self.last_request_time = time.time()
 
 # ==================== ИНИЦИАЛИЗАЦИЯ HTTP СЕССИИ ====================
-async def init_http_session():
+async def init_http_session(app):  # теперь принимает параметр
     global _http_session, _rate_limiter
     _rate_limiter = RateLimiter()
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
@@ -282,7 +282,7 @@ async def init_http_session():
     )
     write_log(f"✅ HTTP-сессия aiohttp инициализирована (v{VERSION})")
 
-async def close_http_session():
+async def close_http_session(app):  # теперь принимает параметр
     global _http_session
     if _http_session:
         await _http_session.close()
@@ -2644,7 +2644,7 @@ def main():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
 
-    # Создаём приложение и используем post_init для инициализации HTTP-сессии
+    # Создаём приложение и используем post_init / post_shutdown
     application = (Application.builder()
                    .token(TELEGRAM_BOT_TOKEN)
                    .connect_timeout(30.0)
