@@ -13,10 +13,6 @@ from telegram.ext import (
     filters, ConversationHandler, CallbackQueryHandler
 )
 from telegram.warnings import PTBUserWarning
-from telegram.helpers import escape_markdown
-
-# ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.4"  # Исправлено дублирование рекламы (удалена запись "Реклама")
 
 # Графики
 import matplotlib.pyplot as plt
@@ -26,12 +22,14 @@ import matplotlib.dates as mdates
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
+# ==================== ВЕРСИЯ БОТА ====================
+VERSION = "2.0.5"  # Удалены отладочные логи транзакций
+
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
 API_MAX_DAYS_PER_REQUEST = 90
 API_RETRY_ATTEMPTS = 3
 API_RETRY_DELAY = 2
-DEBUG_SAMPLE_SIZE = 10
 CACHE_TTL_SECONDS = 300  # 5 минут
 RATE_LIMIT_REQUESTS_PER_SECOND = 2  # Ozon API limit
 
@@ -560,19 +558,11 @@ async def fetch_finance_transactions(date_from, date_to):
     await save_to_cache(cache_key, all_transactions)
     return all_transactions
 
-# ---------- АГРЕГАЦИЯ ФИНАНСОВ ----------
+# ---------- АГРЕГАЦИЯ ФИНАНСОВ (УБРАНЫ ОТЛАДОЧНЫЕ ЛОГИ) ----------
 def aggregate_finance_expenses(transactions):
     expense_by_type = {}
-    unique_types = set()
-    unique_services = set()
-    sample_transactions = []
 
     for t in transactions:
-        if len(sample_transactions) < DEBUG_SAMPLE_SIZE:
-            services = t.get("services", [])
-            if services:
-                sample_transactions.append(t)
-
         sale_comm = t.get("sale_commission", 0)
         if sale_comm < 0:
             expense_by_type["Комиссия Ozon"] = expense_by_type.get("Комиссия Ozon", 0) + abs(sale_comm)
@@ -591,8 +581,6 @@ def aggregate_finance_expenses(transactions):
 
         amount = t.get("amount", 0)
         op_type = t.get("operation_type_name", "Неизвестный тип")
-        if amount < 0:
-            unique_types.add(op_type)
 
         services = t.get("services", [])
         if services and isinstance(services, list):
@@ -604,25 +592,12 @@ def aggregate_finance_expenses(transactions):
                     service_amount = service.get("amount", 0)
                 if service_amount < 0:
                     has_negative_service = True
-                    unique_services.add(service_name)
                     expense_by_type[service_name] = expense_by_type.get(service_name, 0) + abs(service_amount)
             if not has_negative_service and amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
         else:
             if amount < 0:
                 expense_by_type[op_type] = expense_by_type.get(op_type, 0) + abs(amount)
-
-    if sample_transactions:
-        for t in sample_transactions:
-            services = t.get("services", [])
-            write_log(f"🔍 Пример транзакции: amount={t.get('amount')}, operation_type={t.get('operation_type_name')}, sale_commission={t.get('sale_commission')}, accruals_for_sale={t.get('accruals_for_sale')}, services={json.dumps(services, ensure_ascii=False)}")
-
-    if transactions:
-        write_log(f"🔍 Найдены operation_type: {', '.join(unique_types)}")
-        if unique_services:
-            write_log(f"🔍 Найдены услуги (services): {', '.join(unique_services)}")
-        if expense_by_type:
-            write_log(f"🔍 Итоговые категории расходов: {', '.join(expense_by_type.keys())}")
 
     return expense_by_type
 
