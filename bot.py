@@ -16,7 +16,7 @@ from telegram.warnings import PTBUserWarning
 from telegram.helpers import escape_markdown
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.0"  # 🔄 Меняйте этот номер при каждом обновлении кода
+VERSION = "2.0.1"  # 🔄 Меняйте номер при каждом обновлении
 
 # Графики
 import matplotlib.pyplot as plt
@@ -2644,20 +2644,20 @@ def main():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
 
-    # Инициализация HTTP-сессии и лимитера (синхронно)
-    asyncio.run(init_http_session())
-
-    write_log("🚀 Запуск бота...")
+    # Создаём приложение и используем post_init для инициализации HTTP-сессии
     application = (Application.builder()
                    .token(TELEGRAM_BOT_TOKEN)
                    .connect_timeout(30.0)
                    .read_timeout(30.0)
                    .write_timeout(30.0)
+                   .post_init(init_http_session)
+                   .post_shutdown(close_http_session)
                    .build())
 
+    write_log("🚀 Запуск бота...")
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("top", top_products_command))
-    application.add_handler(CommandHandler("version", version_command))  # Новая команда
+    application.add_handler(CommandHandler("version", version_command))
 
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
@@ -2821,10 +2821,7 @@ def main():
         write_log("⚠️ JobQueue недоступен.")
 
     write_log("🚀 Бот готов.")
-    try:
-        application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
-    finally:
-        asyncio.run(close_http_session())
+    application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
 
 if __name__ == "__main__":
     main()
