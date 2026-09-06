@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.9"  # Изменён формат кнопок товара, добавлена версия в меню, "Отмена" → "Назад"
+VERSION = "2.1.0"  # Добавлена "Доля отмен" во все отчёты по продажам
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -1041,6 +1041,12 @@ def format_single_metrics(metrics, title):
     drr_text = f"{drr:.2f}%" if drr is not None else "∞"
     eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
+    # Доля отмен
+    canceled_units = metrics.get('canceled_units', 0)
+    delivered_units = metrics.get('delivered_units', 0)
+    cancel_rate = (canceled_units / delivered_units * 100) if delivered_units > 0 else None
+    cancel_rate_text = f"{cancel_rate:.2f}%" if cancel_rate is not None else "∞"
+
     main_text = (
         f"📊 *{title}*\n\n"
         f"🛒 *Заказано*\n  На сумму: {metrics.get('ordered_sum', 0):,.2f} ₽\n"
@@ -1048,7 +1054,8 @@ def format_single_metrics(metrics, title):
         f"📦 *Доставлено*\n  На сумму: {metrics.get('delivered_sum', 0):,.2f} ₽\n"
         f"  Штук: {metrics.get('delivered_units', 0)}\n\n"
         f"❌ *Отменено*\n  На сумму: {metrics.get('canceled_sum', 0):,.2f} ₽\n"
-        f"  Штук: {metrics.get('canceled_units', 0)}\n\n"
+        f"  Штук: {metrics.get('canceled_units', 0)}\n"
+        f"  Доля отмен: {cancel_rate_text}\n\n"
         f"📢 *Реклама*\n"
         f"  Расходы: {ad_expense:,.2f} ₽\n"
         f"  ДРР (общий): {drr_text}\n"
@@ -1241,6 +1248,11 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     d_can_units_m = calc_delta(month_metrics.get("canceled_units", 0), prev_month_metrics.get("canceled_units", 0))
     d_ad_m = calc_delta(ad_month, ad_prev_period)
 
+    # Доля отмен для сегодня и месяца
+    cancel_rate_today = (today_metrics.get("canceled_units", 0) / today_metrics.get("delivered_units", 0) * 100) if today_metrics.get("delivered_units", 0) > 0 else None
+    cancel_rate_month = (month_metrics["canceled_units"] / month_metrics["delivered_units"] * 100) if month_metrics["delivered_units"] > 0 else None
+    cancel_rate_prev = (prev_month_metrics["canceled_units"] / prev_month_metrics["delivered_units"] * 100) if prev_month_metrics["delivered_units"] > 0 else None
+
     def format_today_block():
         ordered_sum = fmt_num(today_metrics.get("ordered_sum", 0))
         ordered_units = fmt_int(today_metrics.get("ordered_units", 0))
@@ -1252,12 +1264,16 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         delta_can_sum = fmt_pct(calc_delta(today_metrics.get("canceled_sum", 0), yesterday_metrics.get("canceled_sum", 0)))
         delta_can_units = fmt_pct(calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0)))
 
+        # Доля отмен сегодня
+        cancel_rate_text = f"{cancel_rate_today:.2f}%" if cancel_rate_today is not None else "∞"
+
         return (
             f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
             f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n"
             f"    vs Вчера: \n  {delta_ord_sum} ₽ / {delta_ord_units} шт.\n\n"
             f"  ❌ Отменено: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
-            f"    vs Вчера: \n  {delta_can_sum} ₽ / {delta_can_units} шт."
+            f"    vs Вчера: \n  {delta_can_sum} ₽ / {delta_can_units} шт.\n"
+            f"  Доля отмен: {cancel_rate_text}\n"
         )
 
     def format_month_block():
@@ -1292,6 +1308,13 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         delta_can_sum_m = fmt_pct(d_can_sum_m)
         delta_can_units_m = fmt_pct(d_can_units_m)
 
+        # Доля отмен для месяца и сравнение с предыдущим
+        cancel_rate_month_text = f"{cancel_rate_month:.2f}%" if cancel_rate_month is not None else "∞"
+        cancel_rate_prev_text = f"{cancel_rate_prev:.2f}%" if cancel_rate_prev is not None else "∞"
+        cancel_rate_delta = calc_delta(cancel_rate_month if cancel_rate_month is not None else 0,
+                                       cancel_rate_prev if cancel_rate_prev is not None else 0)
+        cancel_rate_delta_text = fmt_pct(cancel_rate_delta)
+
         return (
             f"🔹 *Текущий месяц*\n"
             f"  🛒 Заказано: \n  {ordered_sum} ₽ / {ordered_units} шт.\n"
@@ -1299,7 +1322,8 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
             f"  📦 Доставлено: \n  {delivered_sum} ₽ / {delivered_units} шт.\n"
             f"    vs предыдущий месяц: \n  {delta_del_sum_m} ₽ / {delta_del_units_m} шт.\n\n"
             f"  ❌ Отменено: \n  {canceled_sum} ₽ / {canceled_units} шт.\n"
-            f"    vs предыдущий месяц: \n  {delta_can_sum_m} ₽ / {delta_can_units_m} шт.\n\n"
+            f"    vs предыдущий месяц: \n  {delta_can_sum_m} ₽ / {delta_can_units_m} шт.\n"
+            f"  Доля отмен: {cancel_rate_month_text} | vs предыдущий месяц: {cancel_rate_prev_text} ({cancel_rate_delta_text})\n\n"
             f"  📢 Реклама: \n  {ad_expense} ₽ | vs предыдущий месяц: {ad_prev} ₽\n"
             f"  ДРР (общий): {drr_str} | vs предыдущий месяц: {prev_drr_str}\n"
             f"  ДРР (по доставленным): {eff_drr_str} | vs предыдущий месяц: {prev_eff_drr_str}"
@@ -1691,17 +1715,13 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
         keyboard = []
         for idx, (sku, stats) in enumerate(top_products, 1):
             name = stats['name']  # полное название (до 60 символов уже обрезано)
-            # Сокращаем название до 12 символов, чтобы кнопка была компактной
             short_name = name[:12] + "..." if len(name) > 12 else name
             offer_id = stats.get('offer_id', '')
-            # Формат: АРТИКУЛ SKU НАИМЕНОВАНИЕ
             if offer_id:
-                # Артикул обычно короткий, показываем его полностью
                 button_text = f"{offer_id} {sku} {short_name}"
             else:
                 button_text = f"{sku} {short_name}"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"prod_{sku}")])
-        # Кнопка "Назад" (возврат в меню товаров)
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="prod_cancel")])
         await update.message.reply_text(
             "Выберите товар, нажав на соответствующую кнопку:",
