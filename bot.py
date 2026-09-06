@@ -15,6 +15,9 @@ from telegram.ext import (
 from telegram.warnings import PTBUserWarning
 from telegram.helpers import escape_markdown
 
+# ==================== ВЕРСИЯ БОТА ====================
+VERSION = "2.0.0"  # 🔄 Меняйте этот номер при каждом обновлении кода
+
 # Графики
 import matplotlib.pyplot as plt
 import io
@@ -277,7 +280,7 @@ async def init_http_session():
         timeout=timeout,
         connector=connector
     )
-    write_log("✅ HTTP-сессия aiohttp инициализирована с пулом соединений.")
+    write_log(f"✅ HTTP-сессия aiohttp инициализирована (v{VERSION})")
 
 async def close_http_session():
     global _http_session
@@ -1439,6 +1442,14 @@ async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYP
         line += f"\n   Выручка: {revenue:,.0f} ₽, шт: {units}\n"
         lines.append(line)
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
+
+# ---------- НОВАЯ КОМАНДА /version ----------
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Нет доступа.")
+        return
+    await update.message.reply_text(f"🤖 Версия бота: {VERSION}")
 
 # ---------- КЛАВИАТУРЫ ----------
 def main_admin_keyboard():
@@ -2626,6 +2637,7 @@ async def scheduled_report(context):
 
 # ---------- ЗАПУСК ----------
 def main():
+    write_log(f"🚀 Бот запускается (версия {VERSION})")
     if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]):
         write_log("❌ ОШИБКА: Не все переменные окружения установлены!")
         return
@@ -2645,6 +2657,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("top", top_products_command))
+    application.add_handler(CommandHandler("version", version_command))  # Новая команда
 
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
