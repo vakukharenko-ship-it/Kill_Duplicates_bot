@@ -67,7 +67,7 @@ OZON_FINANCE_URL = "https://api-seller.ozon.ru/v3/finance/transaction/list"
 MANAGERS_FILE = "managers.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
-# Состояния для диалогов (без изменений)
+# Состояния для диалогов
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
 WAITING_PERIOD_START = 3
@@ -100,7 +100,7 @@ WAITING_PRODUCT_SKU_MANUAL = 36
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (синхронные, без изменений) ----------
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (синхронные) ----------
 def write_log(message):
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     full_msg = f"[{timestamp}] {message}"
@@ -269,7 +269,7 @@ async def init_http_session():
     _rate_limiter = RateLimiter()
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
     connector = aiohttp.TCPConnector(
-        limit=50,  # общий пул
+        limit=50,
         limit_per_host=10,
         ttl_dns_cache=300
     )
@@ -317,7 +317,7 @@ async def api_request_with_retry(url, headers, payload=None, method='POST'):
             await asyncio.sleep(API_RETRY_DELAY * (attempt + 1))
     raise Exception("API request failed after retries")
 
-# ---------- ТОКЕН PERFORMANCE (асинхронный) ----------
+# ---------- ТОКЕН PERFORMANCE ----------
 async def get_performance_token():
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы!")
@@ -346,7 +346,7 @@ async def get_performance_token():
         write_log(f"❌ Ошибка при запросе токена: {e}")
         return None
 
-# ---------- ОТГРУЗКИ (FBO) ----------
+# ---------- ОТГРУЗКИ ----------
 async def fetch_postings(date_from, date_to):
     cache_key = f"fetch_postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
@@ -557,7 +557,7 @@ async def fetch_finance_transactions(date_from, date_to):
     await save_to_cache(cache_key, all_transactions)
     return all_transactions
 
-# ---------- АГРЕГАЦИЯ ФИНАНСОВ (без изменений) ----------
+# ---------- АГРЕГАЦИЯ ФИНАНСОВ ----------
 def aggregate_finance_expenses(transactions):
     expense_by_type = {}
     unique_types = set()
@@ -623,7 +623,7 @@ def aggregate_finance_expenses(transactions):
 
     return expense_by_type
 
-# ---------- АГРЕГАЦИЯ ОТГРУЗОК (без изменений) ----------
+# ---------- АГРЕГАЦИЯ ОТГРУЗОК ----------
 def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
     aggregated = {}
     for posting in postings:
@@ -681,9 +681,8 @@ def aggregate_postings(postings, date_from=None, date_to=None, time_limit=None, 
 
     return aggregated
 
-# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ (asyncio.gather) ----------
+# ---------- ПАРАЛЛЕЛЬНАЯ ЗАГРУЗКА ДАННЫХ ----------
 async def fetch_metrics_parallel(date_from, date_to):
-    """Параллельно загружает отгрузки, рекламу и финансовые транзакции."""
     postings_task = fetch_postings(date_from, date_to)
     ad_task = fetch_advertising_expense(date_from, date_to)
     finance_task = fetch_finance_transactions(date_from, date_to)
@@ -693,7 +692,6 @@ async def fetch_metrics_parallel(date_from, date_to):
     return postings, ad_expense, transactions
 
 async def fetch_metrics_for_period_parallel(date_from, date_to):
-    """Обёртка для получения агрегированных метрик с параллельными запросами."""
     postings, ad_expense, transactions = await fetch_metrics_parallel(date_from, date_to)
     agg = aggregate_postings(postings, date_from=date_from, date_to=date_to)
     total = {
@@ -723,7 +721,7 @@ async def fetch_metrics_for_period_parallel(date_from, date_to):
     total["expenses"] = expenses
     return total
 
-# ---------- ФУНКЦИИ ДЛЯ ТОВАРНОЙ АНАЛИТИКИ (без изменений) ----------
+# ---------- ТОВАРНАЯ АНАЛИТИКА ----------
 def aggregate_products(postings, date_from=None, date_to=None, time_limit=None, apply_limit_on_day=None):
     product_stats = {}
     for posting in postings:
@@ -834,7 +832,7 @@ async def get_top_products_for_select(days=30):
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:20]
     return [(sku, stats) for sku, stats in sorted_items]
 
-# ---------- ГРАФИКИ (без изменений, но функции fetch асинхронные) ----------
+# ---------- ГРАФИКИ ----------
 async def generate_product_chart_by_metric(sku, metric, years):
     data = {}
     for year in years:
@@ -969,7 +967,7 @@ async def generate_sales_chart(years_list):
     plt.close(fig)
     return buf
 
-# ---------- ФОРМАТИРОВАНИЕ ОТЧЁТОВ (без изменений) ----------
+# ---------- ФОРМАТИРОВАНИЕ ОТЧЁТОВ ----------
 def format_expense_block(expenses_by_type, title):
     if not expenses_by_type:
         return f"🔹 *{title}*\nНет данных о расходах.\n"
@@ -1093,7 +1091,6 @@ async def get_metrics_for_date(date_str):
     today = get_moscow_today()
     start = (today - datetime.timedelta(days=183)).strftime("%Y-%m-%d")
     end = today.strftime("%Y-%m-%d")
-    # Параллельно загружаем посты, рекламу и финансы за указанную дату
     postings_task = fetch_postings(start, end)
     ad_task = fetch_advertising_expense(date_str, date_str)
     fin_task = fetch_finance_transactions(date_str, date_str)
@@ -1120,7 +1117,7 @@ async def get_metrics_for_date(date_str):
 async def get_metrics_for_period(date_from, date_to):
     return await fetch_metrics_for_period_parallel(date_from, date_to)
 
-# ---------- ФУНКЦИИ ДЛЯ КОМБИНИРОВАННОГО ОТЧЁТА (сегодня/месяц) ----------
+# ---------- ФУНКЦИИ ДЛЯ КОМБИНИРОВАННОГО ОТЧЁТА ----------
 async def format_combined_metrics_with_deltas(include_yesterday=False):
     now = get_current_time_msk()
     today_date = now.date()
@@ -1142,12 +1139,10 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     prev_period_end = previous_month_start + datetime.timedelta(days=days_passed - 1)
     prev_period_end_str = prev_period_end.isoformat()
 
-    # Загружаем данные для текущего и предыдущего месяца параллельно
     postings_current_task = fetch_postings(current_month_start_str, current_month_end_str)
     postings_prev_task = fetch_postings(previous_month_start_str, previous_month_end_str)
     postings_current, postings_prev = await asyncio.gather(postings_current_task, postings_prev_task)
 
-    # Агрегация для вчера и сегодня с учётом времени
     agg_yesterday_full = aggregate_postings(
         postings_current,
         date_from=yesterday_str,
@@ -1211,7 +1206,6 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         for key in prev_month_metrics:
             prev_month_metrics[key] += vals.get(key, 0)
 
-    # Рекламные расходы и финансы - параллельно для всех нужных периодов
     ad_today_task = fetch_advertising_expense(today_str, today_str)
     ad_yesterday_task = fetch_advertising_expense(yesterday_str, yesterday_str)
     ad_month_task = fetch_advertising_expense(current_month_start_str, today_str)
@@ -1232,7 +1226,6 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     if ad_month > 0:
         expenses_month["Реклама"] = ad_month
 
-    # Форматирование (без изменений)
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
 
@@ -1413,7 +1406,7 @@ async def format_product_combined():
 
     return "📦 Отчёт по товарам\n\n\n" + "\n\n".join(parts)
 
-# ---------- КОМАНДА /top (асинхронная) ----------
+# ---------- КОМАНДА /top ----------
 async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not has_access(chat_id):
@@ -1447,7 +1440,7 @@ async def top_products_command(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(line)
     await update.message.reply_text("\n".join(lines), parse_mode='HTML')
 
-# ---------- КЛАВИАТУРЫ (без изменений) ----------
+# ---------- КЛАВИАТУРЫ ----------
 def main_admin_keyboard():
     buttons = [
         [KeyboardButton("📊 Отчёт по продажам")],
@@ -1493,7 +1486,7 @@ def admin_keyboard():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
-# ---------- ОБРАБОТЧИКИ КОМАНД (асинхронные) ----------
+# ---------- ОБРАБОТЧИКИ КОМАНД ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -1735,7 +1728,7 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Неизвестная команда.")
 
-# ---------- ДИАЛОГИ АДМИНИСТРИРОВАНИЯ (без изменений) ----------
+# ---------- ДИАЛОГИ АДМИНИСТРИРОВАНИЯ ----------
 async def add_manager_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Введите ID (число) или username (без @):")
     return WAITING_ADD_MANAGER
@@ -2058,7 +2051,7 @@ async def product_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop('product_range_start', None)
     return ConversationHandler.END
 
-# ---------- INLINE CALLBACK для продаж (асинхронный) ----------
+# ---------- INLINE CALLBACK для продаж ----------
 async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2613,7 +2606,7 @@ async def dynamics_range_end(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop('dynamics_range_start', None)
     return ConversationHandler.END
 
-# ---------- ПЛАНИРОВЩИК (асинхронный) ----------
+# ---------- ПЛАНИРОВЩИК ----------
 async def scheduled_report(context):
     moscow_tz = MOSCOW_TZ
     now = datetime.datetime.now(moscow_tz)
@@ -2632,15 +2625,15 @@ async def scheduled_report(context):
             write_log(f"Ошибка отправки {m['id']}: {e}")
 
 # ---------- ЗАПУСК ----------
-async def main():
+def main():
     if not all([OZON_CLIENT_ID, OZON_API_KEY, TELEGRAM_BOT_TOKEN]):
         write_log("❌ ОШИБКА: Не все переменные окружения установлены!")
         return
     if not OZON_PERFORMANCE_CLIENT_ID or not OZON_PERFORMANCE_CLIENT_SECRET:
         write_log("⚠️ ВНИМАНИЕ: OZON_PERFORMANCE_CLIENT_ID или CLIENT_SECRET не заданы. Рекламные расходы не будут отображаться.")
 
-    # Инициализация HTTP-сессии и лимитера
-    await init_http_session()
+    # Инициализация HTTP-сессии и лимитера (синхронно)
+    asyncio.run(init_http_session())
 
     write_log("🚀 Запуск бота...")
     application = (Application.builder()
@@ -2816,9 +2809,9 @@ async def main():
 
     write_log("🚀 Бот готов.")
     try:
-        await application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
+        application.run_polling(allowed_updates=Update.ALL_TYPES, timeout=30)
     finally:
-        await close_http_session()
+        asyncio.run(close_http_session())
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
