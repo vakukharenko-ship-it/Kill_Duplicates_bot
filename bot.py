@@ -16,7 +16,7 @@ from telegram.warnings import PTBUserWarning
 from telegram.helpers import escape_markdown
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.3"  # Исправлено дублирование рекламы в расходах
+VERSION = "2.0.4"  # Исправлено дублирование рекламы (удалена запись "Реклама")
 
 # Графики
 import matplotlib.pyplot as plt
@@ -1027,7 +1027,7 @@ def format_expense_block(expenses_by_type, title):
         "Баллы за скидки": "Баллы за скидки",
         "Выручка": "Выручка",
         "Возврат выручки": "Возврат выручки",
-        "Реклама": "Реклама",  # оставлено для совместимости, но теперь не будет использоваться
+        # "Реклама" – убрали, чтобы не дублировалось
     }
 
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
@@ -1225,10 +1225,13 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     expenses_month = aggregate_finance_expenses(fin_month)
 
     # Рекламные расходы добавляем в категорию "Оплата за клик" (если уже есть, то суммируем)
+    # и удаляем отдельную запись "Реклама", если она появилась из финансов
     if ad_today > 0:
         expenses_today["Оплата за клик"] = expenses_today.get("Оплата за клик", 0) + ad_today
+        expenses_today.pop("Реклама", None)
     if ad_month > 0:
         expenses_month["Оплата за клик"] = expenses_month.get("Оплата за клик", 0) + ad_month
+        expenses_month.pop("Реклама", None)
 
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
