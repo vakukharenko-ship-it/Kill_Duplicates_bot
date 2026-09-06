@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.1.0"  # Добавлена "Доля отмен" во все отчёты по продажам
+VERSION = "2.1.1"  # Добавлено сравнение с предыдущим периодом для "По месяцам/кварталам/годам"
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -247,6 +247,221 @@ def validate_period(date_from, date_to):
 
 def get_current_time_msk():
     return datetime.datetime.now(MOSCOW_TZ)
+
+# ---------- УТИЛИТЫ ДЛЯ ФОРМАТИРОВАНИЯ ----------
+def fmt_num(val):
+    return f"{val:,.2f}".replace(",", " ") if val else "0.00"
+
+def fmt_int(val):
+    return str(val) if val else "0"
+
+def fmt_pct(val):
+    if val is None:
+        return "∞"
+    if val > 0:
+        return f"+{val:.1f}%"
+    elif val < 0:
+        return f"{val:.1f}%"
+    else:
+        return f"{val:.1f}%"
+
+def calc_delta(current, previous):
+    if previous == 0:
+        return None
+    try:
+        return ((current - previous) / abs(previous)) * 100
+    except:
+        return None
+
+def indicator(value_current, value_prev, better_is_higher):
+    """Возвращает 🟢 если улучшение, 🔴 если ухудшение, иначе пустую строку"""
+    if value_prev is None or value_current is None:
+        return ""
+    if value_prev == 0:
+        return "🟢" if value_current > 0 else ""
+    delta = calc_delta(value_current, value_prev)
+    if delta is None:
+        return ""
+    if better_is_higher:
+        return "🟢" if delta > 0 else ("🔴" if delta < 0 else "")
+    else:
+        return "🟢" if delta < 0 else ("🔴" if delta > 0 else "")
+
+def format_expense_comparison(expenses_current, expenses_prev, title):
+    """Форматирует блок расходов с сравнением двух периодов"""
+    if not expenses_current and not expenses_prev:
+        return f"🔹 *{title}*\nНет данных о расходах.\n"
+    
+    total_current = sum(expenses_current.values()) if expenses_current else 0
+    total_prev = sum(expenses_prev.values()) if expenses_prev else 0
+    total_indicator = indicator(total_current, total_prev, False)
+    lines = [f"🔹 *{title}*"]
+    lines.append(f"  Итого расходов: {fmt_num(total_current)} ₽ / {fmt_num(total_prev)} ₽ {total_indicator}")
+    
+    # Объединяем все категории из обоих словарей
+    all_categories = set(expenses_current.keys()) | set(expenses_prev.keys())
+    sorted_categories = sorted(all_categories, key=lambda x: expenses_current.get(x, 0), reverse=True)
+    
+    name_map = {
+        "Комиссия Ozon": "Комиссия",
+        "Оплата эквайринга": "Эквайринг",
+        "Доставка покупателю": "Доставка покупателю",
+        "Доставка и обработка возврата, отмены, невыкупа": "Доставка/возвраты",
+        "Кросс-докинг": "Кросс-докинг",
+        "Страхование товара от массовых повреждений": "Страхование",
+        "Обеспечение материалами для упаковки товара": "Обеспечение упаковкой",
+        "Упаковка товара партнёрами": "Упаковка",
+        "Подписка Управление отзывами": "Подписка",
+        "Оплата за клик": "Оплата за клик",
+        "Получение возврата, отмены, невыкупа от покупателя": "Получение возвратов",
+        "MarketplaceServiceItemDirectFlowLogistic": "Логистика прямая",
+        "MarketplaceServiceItemRedistributionLastMileCourier": "Логистика последняя миля",
+        "MarketplaceServiceItemReturnFlowLogistic": "Логистика возврат",
+        "MarketplaceServiceItemDeliveryToHandoverPlaceOzon": "Доставка до ПВЗ",
+        "MarketplaceRedistributionOfAcquiringOperation": "Эквайринг",
+        "MarketplaceServiceItemRedistributionReturnsPVZ": "Обработка возвратов (ПВЗ)",
+        "MarketplaceServiceItemPackageRedistribution": "Переупаковка",
+        "MarketplaceServiceItemPackageMaterialsProvision": "Обеспечение упаковкой",
+        "MarketplaceServiceItemProductReviewsManagementSubscription": "Подписка",
+        "MarketplaceServiceItemRedistributionLastMilePVZ": "Логистика последняя миля (ПВЗ)",
+        "MarketplaceServiceItemDirectFlowLogisticFBS": "Логистика прямая (FBS)",
+        "MarketplaceServiceItemReturnFlowLogisticFBS": "Логистика возврат (FBS)",
+        "ItemAgentServiceStarsMembership": "Звёздные товары",
+        "MarketplaceServiceSellerReturnsCargoAssortment": "Обработка возвратов партнёрами",
+        "MarketplaceServiceItemTemporaryStorageRedistribution": "Временное размещение",
+        "MarketplaceServiceProductMovementFromWarehouse": "Вывоз до ПВЗ",
+        "MarketplaceServiceItemDisposalDetailed": "Утилизация",
+        "Звёздные товары": "Звёздные товары",
+        "Временное размещение товара партнерами": "Временное размещение",
+        "Обработка товара в составе грузоместа: Поштучная приёмка": "Поштучная приёмка",
+        "Обработка товара в составе грузоместа на FBO": "Поштучная приёмка",
+        "Подготовка товара к вывозу: Брак": "Подготовка к вывозу (брак)",
+        "Вывоз товара со склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
+        "Вывоз товара со Склада силами Ozon: Доставка до ПВЗ": "Вывоз до ПВЗ",
+        "Бронирование места и персонала для поставки с неполным составом в составе грузоместа": "Бронирование места",
+        "Услуга по бронированию места и персонала для поставки с неполным составом в составе ГМ": "Бронирование места",
+        "Обработка опознанных излишков в составе грузоместа": "Обработка излишков",
+        "Услуга по обработке опознанных излишков в составе ГМ": "Обработка излишков",
+        "Утилизация товара: Пролились/просыпались из-за упаковки": "Утилизация",
+        "Потеря по вине Ozon на складе": "Потеря (склад)",
+        "Потеря по вине Ozon в логистике": "Потеря (логистика)",
+        "Вознаграждение за продажу": "Вознаграждение",
+        "Возврат вознаграждения": "Возврат вознаграждения",
+        "Программы партнёров": "Программы партнёров",
+        "Баллы за скидки": "Баллы за скидки",
+        "Выручка": "Выручка",
+        "Возврат выручки": "Возврат выручки",
+    }
+    
+    for category in sorted_categories:
+        amount_cur = expenses_current.get(category, 0)
+        amount_prev = expenses_prev.get(category, 0)
+        ind = indicator(amount_cur, amount_prev, False)
+        short_name = name_map.get(category, category)
+        lines.append(f"    {short_name}: {fmt_num(amount_cur)} ₽ / {fmt_num(amount_prev)} ₽ {ind}")
+    
+    return "\n".join(lines)
+
+def format_period_comparison_metrics(metrics_current, metrics_prev, period_name):
+    """
+    Формирует отчёт с сравнением текущего и предыдущего периодов.
+    period_name - название периода (например "August 2026", "Q1 2026", "2026")
+    """
+    # Извлекаем значения
+    cur_ordered_sum = metrics_current.get('ordered_sum', 0)
+    cur_ordered_units = metrics_current.get('ordered_units', 0)
+    cur_delivered_sum = metrics_current.get('delivered_sum', 0)
+    cur_delivered_units = metrics_current.get('delivered_units', 0)
+    cur_canceled_sum = metrics_current.get('canceled_sum', 0)
+    cur_canceled_units = metrics_current.get('canceled_units', 0)
+    cur_ad_expense = metrics_current.get('ad_expense', 0)
+    cur_drr = metrics_current.get('drr')
+    cur_eff_drr = metrics_current.get('effective_drr')
+    cur_expenses = metrics_current.get('expenses', {})
+
+    prev_ordered_sum = metrics_prev.get('ordered_sum', 0)
+    prev_ordered_units = metrics_prev.get('ordered_units', 0)
+    prev_delivered_sum = metrics_prev.get('delivered_sum', 0)
+    prev_delivered_units = metrics_prev.get('delivered_units', 0)
+    prev_canceled_sum = metrics_prev.get('canceled_sum', 0)
+    prev_canceled_units = metrics_prev.get('canceled_units', 0)
+    prev_ad_expense = metrics_prev.get('ad_expense', 0)
+    prev_drr = metrics_prev.get('drr')
+    prev_eff_drr = metrics_prev.get('effective_drr')
+    prev_expenses = metrics_prev.get('expenses', {})
+
+    # Доля отмен
+    cur_cancel_rate = (cur_canceled_units / cur_delivered_units * 100) if cur_delivered_units > 0 else None
+    prev_cancel_rate = (prev_canceled_units / prev_delivered_units * 100) if prev_delivered_units > 0 else None
+
+    # Индикаторы
+    ind_ordered_sum = indicator(cur_ordered_sum, prev_ordered_sum, True)
+    ind_ordered_units = indicator(cur_ordered_units, prev_ordered_units, True)
+    ind_delivered_sum = indicator(cur_delivered_sum, prev_delivered_sum, True)
+    ind_delivered_units = indicator(cur_delivered_units, prev_delivered_units, True)
+    ind_canceled_sum = indicator(cur_canceled_sum, prev_canceled_sum, False)
+    ind_canceled_units = indicator(cur_canceled_units, prev_canceled_units, False)
+    ind_cancel_rate = indicator(cur_cancel_rate, prev_cancel_rate, False)
+    ind_ad_expense = indicator(cur_ad_expense, prev_ad_expense, False)
+    ind_drr = indicator(cur_drr, prev_drr, False)
+    ind_eff_drr = indicator(cur_eff_drr, prev_eff_drr, False)
+
+    # Формируем строки
+    lines = []
+    lines.append(f"📊 *Продажи за {period_name}*")
+    lines.append("")
+
+    # Заказано
+    lines.append(f"🛒 *Заказано*")
+    lines.append(f"  На сумму: {fmt_num(cur_ordered_sum)} ₽ {ind_ordered_sum}")
+    lines.append(f"  Штук: {fmt_int(cur_ordered_units)} {ind_ordered_units}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  На сумму: {fmt_num(prev_ordered_sum)} ₽")
+    lines.append(f"  Штук: {fmt_int(prev_ordered_units)}")
+    lines.append("")
+
+    # Доставлено
+    lines.append(f"📦 *Доставлено*")
+    lines.append(f"  На сумму: {fmt_num(cur_delivered_sum)} ₽ {ind_delivered_sum}")
+    lines.append(f"  Штук: {fmt_int(cur_delivered_units)} {ind_delivered_units}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  На сумму: {fmt_num(prev_delivered_sum)} ₽")
+    lines.append(f"  Штук: {fmt_int(prev_delivered_units)}")
+    lines.append("")
+
+    # Отменено
+    lines.append(f"❌ *Отменено*")
+    lines.append(f"  На сумму: {fmt_num(cur_canceled_sum)} ₽ {ind_canceled_sum}")
+    lines.append(f"  Штук: {fmt_int(cur_canceled_units)} {ind_canceled_units}")
+    cur_cancel_rate_text = f"{cur_cancel_rate:.2f}%" if cur_cancel_rate is not None else "∞"
+    prev_cancel_rate_text = f"{prev_cancel_rate:.2f}%" if prev_cancel_rate is not None else "∞"
+    lines.append(f"  Доля отмен: {cur_cancel_rate_text} {ind_cancel_rate}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  На сумму: {fmt_num(prev_canceled_sum)} ₽")
+    lines.append(f"  Штук: {fmt_int(prev_canceled_units)}")
+    lines.append(f"  Доля отмен: {prev_cancel_rate_text}")
+    lines.append("")
+
+    # Реклама
+    lines.append(f"📢 *Реклама*")
+    lines.append(f"  Расходы: {fmt_num(cur_ad_expense)} ₽ {ind_ad_expense}")
+    cur_drr_text = f"{cur_drr:.2f}%" if cur_drr is not None else "∞"
+    cur_eff_drr_text = f"{cur_eff_drr:.2f}%" if cur_eff_drr is not None else "∞"
+    prev_drr_text = f"{prev_drr:.2f}%" if prev_drr is not None else "∞"
+    prev_eff_drr_text = f"{prev_eff_drr:.2f}%" if prev_eff_drr is not None else "∞"
+    lines.append(f"  ДРР (общий): {cur_drr_text} {ind_drr}")
+    lines.append(f"  ДРР (по доставленным): {cur_eff_drr_text} {ind_eff_drr}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  Расходы: {fmt_num(prev_ad_expense)} ₽")
+    lines.append(f"  ДРР (общий): {prev_drr_text}")
+    lines.append(f"  ДРР (по доставленным): {prev_eff_drr_text}")
+    lines.append("")
+
+    # Расходы (сравнение)
+    expense_block = format_expense_comparison(cur_expenses, prev_expenses, "Расходы за период")
+    lines.append(expense_block)
+
+    return "\n".join(lines)
 
 # ==================== КЛАСС ДЛЯ РЕЙТ-ЛИМИТА ====================
 class RateLimiter:
@@ -1041,7 +1256,6 @@ def format_single_metrics(metrics, title):
     drr_text = f"{drr:.2f}%" if drr is not None else "∞"
     eff_drr_text = f"{eff_drr:.2f}%" if eff_drr is not None else "∞"
 
-    # Доля отмен
     canceled_units = metrics.get('canceled_units', 0)
     delivered_units = metrics.get('delivered_units', 0)
     cancel_rate = (canceled_units / delivered_units * 100) if delivered_units > 0 else None
@@ -1212,22 +1426,6 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         expenses_month["Оплата за клик"] = ad_month
         expenses_month.pop("Реклама", None)
 
-    def fmt_num(val):
-        return f"{val:,.2f}".replace(",", " ") if val else "0.00"
-
-    def fmt_int(val):
-        return str(val) if val else "0"
-
-    def fmt_pct(val):
-        if val is None:
-            return "∞"
-        if val > 0:
-            return f"+{val:.1f}%"
-        elif val < 0:
-            return f"{val:.1f}%"
-        else:
-            return f"{val:.1f}%"
-
     def calc_delta(current, previous):
         if previous == 0:
             return None
@@ -1264,7 +1462,6 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         delta_can_sum = fmt_pct(calc_delta(today_metrics.get("canceled_sum", 0), yesterday_metrics.get("canceled_sum", 0)))
         delta_can_units = fmt_pct(calc_delta(today_metrics.get("canceled_units", 0), yesterday_metrics.get("canceled_units", 0)))
 
-        # Доля отмен сегодня
         cancel_rate_text = f"{cancel_rate_today:.2f}%" if cancel_rate_today is not None else "∞"
 
         return (
@@ -1308,7 +1505,6 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
         delta_can_sum_m = fmt_pct(d_can_sum_m)
         delta_can_units_m = fmt_pct(d_can_units_m)
 
-        # Доля отмен для месяца и сравнение с предыдущим
         cancel_rate_month_text = f"{cancel_rate_month:.2f}%" if cancel_rate_month is not None else "∞"
         cancel_rate_prev_text = f"{cancel_rate_prev:.2f}%" if cancel_rate_prev is not None else "∞"
         cancel_rate_delta = calc_delta(cancel_rate_month if cancel_rate_month is not None else 0,
@@ -1714,7 +1910,7 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
         context.user_data['product_list'] = top_products
         keyboard = []
         for idx, (sku, stats) in enumerate(top_products, 1):
-            name = stats['name']  # полное название (до 60 символов уже обрезано)
+            name = stats['name']
             short_name = name[:12] + "..." if len(name) > 12 else name
             offer_id = stats.get('offer_id', '')
             if offer_id:
@@ -2128,6 +2324,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
 
+    # ---------- ОБРАБОТКА ВЫБОРА ГОДА ДЛЯ МЕСЯЦЕВ ----------
     if data.startswith("period_year_month_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -2137,6 +2334,8 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_MONTH
+
+    # ---------- ОБРАБОТКА ВЫБОРА КВАРТАЛА ----------
     if data.startswith("period_year_quarter_"):
         year = int(data.split("_")[-1])
         context.user_data['period_year'] = year
@@ -2146,16 +2345,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_QUARTER
 
+    # ---------- ОБРАБОТКА ВЫБОРА ГОДА (отчёт за год) ----------
     if data.startswith("period_year_only_"):
         year = int(data.split("_")[-1])
         first_day = datetime.date(year, 1, 1)
         last_day = datetime.date(year, 12, 31)
-        metrics = await get_metrics_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
-        msg = format_single_metrics(metrics, f"Продажи за {year} год")
-        await query.edit_message_text(msg, parse_mode="Markdown")
+        metrics_current = await get_metrics_for_period(first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d"))
+        # Предыдущий год
+        prev_year = year - 1
+        prev_first_day = datetime.date(prev_year, 1, 1)
+        prev_last_day = datetime.date(prev_year, 12, 31)
+        metrics_prev = await get_metrics_for_period(prev_first_day.strftime("%Y-%m-%d"), prev_last_day.strftime("%Y-%m-%d"))
+        period_name = str(year)
+        report = format_period_comparison_metrics(metrics_current, metrics_prev, period_name)
+        await query.edit_message_text(report, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
 
+    # ---------- ОБРАБОТКА ВЫБОРА МЕСЯЦА ----------
     if data.startswith("period_month_"):
         parts = data.split("_")
         month_num, year = int(parts[2]), int(parts[3])
@@ -2165,12 +2372,30 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             last_day = datetime.date(year, month_num+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        metrics = await get_metrics_for_period(date_from, date_to)
-        msg = format_single_metrics(metrics, f"Продажи за {first_day.strftime('%B %Y')}")
-        await query.edit_message_text(msg, parse_mode="Markdown")
+        metrics_current = await get_metrics_for_period(date_from, date_to)
+        # Предыдущий месяц
+        if month_num == 1:
+            prev_month_num = 12
+            prev_year = year - 1
+        else:
+            prev_month_num = month_num - 1
+            prev_year = year
+        prev_first_day = datetime.date(prev_year, prev_month_num, 1)
+        if prev_month_num == 12:
+            prev_last_day = datetime.date(prev_year, 12, 31)
+        else:
+            prev_last_day = datetime.date(prev_year, prev_month_num+1, 1) - datetime.timedelta(days=1)
+        metrics_prev = await get_metrics_for_period(prev_first_day.strftime("%Y-%m-%d"), prev_last_day.strftime("%Y-%m-%d"))
+        # Название месяца
+        month_names = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+                       "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+        period_name = f"{month_names[month_num-1]} {year}"
+        report = format_period_comparison_metrics(metrics_current, metrics_prev, period_name)
+        await query.edit_message_text(report, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
 
+    # ---------- ОБРАБОТКА ВЫБОРА КВАРТАЛА ----------
     if data.startswith("period_quarter_"):
         parts = data.split("_")
         q, year = int(parts[2]), int(parts[3])
@@ -2182,12 +2407,31 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             last_day = datetime.date(year, end_month+1, 1) - datetime.timedelta(days=1)
         date_from, date_to = first_day.strftime("%Y-%m-%d"), last_day.strftime("%Y-%m-%d")
-        metrics = await get_metrics_for_period(date_from, date_to)
-        msg = format_single_metrics(metrics, f"Продажи за {q} квартал {year}")
-        await query.edit_message_text(msg, parse_mode="Markdown")
+        metrics_current = await get_metrics_for_period(date_from, date_to)
+        # Предыдущий квартал
+        if q == 1:
+            prev_q = 4
+            prev_year = year - 1
+            prev_start_month = (prev_q-1)*3 + 1
+            prev_end_month = prev_q*3
+        else:
+            prev_q = q - 1
+            prev_year = year
+            prev_start_month = (prev_q-1)*3 + 1
+            prev_end_month = prev_q*3
+        prev_first_day = datetime.date(prev_year, prev_start_month, 1)
+        if prev_end_month == 12:
+            prev_last_day = datetime.date(prev_year, 12, 31)
+        else:
+            prev_last_day = datetime.date(prev_year, prev_end_month+1, 1) - datetime.timedelta(days=1)
+        metrics_prev = await get_metrics_for_period(prev_first_day.strftime("%Y-%m-%d"), prev_last_day.strftime("%Y-%m-%d"))
+        period_name = f"{q} квартал {year}"
+        report = format_period_comparison_metrics(metrics_current, metrics_prev, period_name)
+        await query.edit_message_text(report, parse_mode="Markdown")
         await query.message.reply_text("Выберите действие:", reply_markup=sales_reports_keyboard())
         return ConversationHandler.END
 
+    # ---------- ПРОИЗВОЛЬНЫЙ ПЕРИОД ----------
     if data.startswith("start_"):
         if data == "start_cancel":
             await query.edit_message_text("Выбор периода отменён.")
@@ -2278,7 +2522,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("❌ Ошибка формата даты.")
             return WAITING_PERIOD_END
 
-    # Динамика продаж (график)
+    # ---------- ДИНАМИКА ПРОДАЖ ----------
     if data == "dynamics_current":
         await query.edit_message_text("⏳ Загружаю данные для текущего года...")
         current_year = get_moscow_today().year
