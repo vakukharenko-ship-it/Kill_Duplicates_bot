@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.8"  # Кнопки товара однострочные, без переносов
+VERSION = "2.0.9"  # Изменён формат кнопок товара, добавлена версия в меню, "Отмена" → "Назад"
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -215,7 +215,7 @@ def create_calendar(year, month, callback_prefix):
         InlineKeyboardButton("▶️", callback_data=f"{callback_prefix}next_month_{year}_{month}")
     ]
     keyboard.append(nav_row)
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"{callback_prefix}cancel")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"{callback_prefix}cancel")])
     return InlineKeyboardMarkup(keyboard)
 
 def validate_date(date_str):
@@ -1480,12 +1480,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(chat_id):
         name = user.first_name if user.first_name else ""
         greeting = get_greeting(name)
-        await update.message.reply_text(greeting, reply_markup=main_admin_keyboard())
+        await update.message.reply_text(
+            f"{greeting}\n\n🤖 Версия бота: {VERSION}",
+            reply_markup=main_admin_keyboard()
+        )
     elif is_manager(chat_id):
         manager = get_manager_info(chat_id)
         name = manager.get("first_name") if manager and manager.get("first_name") else user.first_name or ""
         greeting = get_greeting(name)
-        await update.message.reply_text(greeting, reply_markup=main_user_keyboard())
+        await update.message.reply_text(
+            f"{greeting}\n\n🤖 Версия бота: {VERSION}",
+            reply_markup=main_user_keyboard()
+        )
     else:
         await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.", reply_markup=ReplyKeyboardRemove())
 
@@ -1543,7 +1549,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
                 "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n\n"
+                f"🤖 Версия бота: {VERSION}"
             )
         else:
             help_text = (
@@ -1568,7 +1575,8 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
                 "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n\n"
+                f"🤖 Версия бота: {VERSION}"
             )
         await update.message.reply_text(help_text, parse_mode="Markdown")
         return
@@ -1581,9 +1589,15 @@ async def handle_sales_reports(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == "🔙 Назад":
         if is_admin(chat_id):
-            await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
+            await update.message.reply_text(
+                f"Главное меню\n\n🤖 Версия бота: {VERSION}",
+                reply_markup=main_admin_keyboard()
+            )
         else:
-            await update.message.reply_text("Главное меню", reply_markup=main_user_keyboard())
+            await update.message.reply_text(
+                f"Главное меню\n\n🤖 Версия бота: {VERSION}",
+                reply_markup=main_user_keyboard()
+            )
         return
 
     if not has_access(chat_id):
@@ -1604,7 +1618,7 @@ async def handle_sales_reports(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("📅 По кварталам", callback_data="period_quarter")],
             [InlineKeyboardButton("📆 По годам", callback_data="period_year")],
             [InlineKeyboardButton("📊 Произвольный период", callback_data="period_custom")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")]
         ])
         await update.message.reply_text("Выберите тип периода:", reply_markup=keyboard)
         return WAITING_PERIOD_TYPE
@@ -1615,7 +1629,7 @@ async def handle_sales_reports(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("📅 Текущий год", callback_data="dynamics_current")],
             [InlineKeyboardButton("📆 Выбрать год", callback_data="dynamics_select")],
             [InlineKeyboardButton("📊 Диапазон лет", callback_data="dynamics_range")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="dynamics_cancel")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="dynamics_cancel")]
         ]
         await update.message.reply_text(
             "Выберите вариант для построения графика:\n"
@@ -1634,9 +1648,15 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
 
     if text == "🔙 Назад":
         if is_admin(chat_id):
-            await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
+            await update.message.reply_text(
+                f"Главное меню\n\n🤖 Версия бота: {VERSION}",
+                reply_markup=main_admin_keyboard()
+            )
         else:
-            await update.message.reply_text("Главное меню", reply_markup=main_user_keyboard())
+            await update.message.reply_text(
+                f"Главное меню\n\n🤖 Версия бота: {VERSION}",
+                reply_markup=main_user_keyboard()
+            )
         return
 
     if not has_access(chat_id):
@@ -1657,7 +1677,7 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("📅 По кварталам", callback_data="pquarter")],
             [InlineKeyboardButton("📆 По годам", callback_data="pyear")],
             [InlineKeyboardButton("📊 Произвольный период", callback_data="pcustom")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="pcancel")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="pcancel")]
         ])
         await update.message.reply_text("Выберите тип периода для товаров:", reply_markup=keyboard)
         return WAITING_PRODUCT_PERIOD_TYPE
@@ -1671,17 +1691,18 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
         keyboard = []
         for idx, (sku, stats) in enumerate(top_products, 1):
             name = stats['name']  # полное название (до 60 символов уже обрезано)
-            # Сокращаем название до 25 символов, чтобы влезло в кнопку
-            short_name = name[:25] + "..." if len(name) > 25 else name
+            # Сокращаем название до 12 символов, чтобы кнопка была компактной
+            short_name = name[:12] + "..." if len(name) > 12 else name
             offer_id = stats.get('offer_id', '')
-            # Формируем текст кнопки в одну строку
+            # Формат: АРТИКУЛ SKU НАИМЕНОВАНИЕ
             if offer_id:
-                button_text = f"{short_name} (SKU:{sku} ART:{offer_id})"
+                # Артикул обычно короткий, показываем его полностью
+                button_text = f"{offer_id} {sku} {short_name}"
             else:
-                button_text = f"{short_name} (SKU:{sku})"
+                button_text = f"{sku} {short_name}"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"prod_{sku}")])
-        # Кнопка отмены
-        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="prod_cancel")])
+        # Кнопка "Назад" (возврат в меню товаров)
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="prod_cancel")])
         await update.message.reply_text(
             "Выберите товар, нажав на соответствующую кнопку:",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -1714,7 +1735,10 @@ async def handle_admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(info)
             await update.message.reply_text("\n".join(lines))
     elif text == "🔙 Назад":
-        await update.message.reply_text("Главное меню", reply_markup=main_admin_keyboard())
+        await update.message.reply_text(
+            f"Главное меню\n\n🤖 Версия бота: {VERSION}",
+            reply_markup=main_admin_keyboard()
+        )
     else:
         await update.message.reply_text("Неизвестная команда.")
 
@@ -1813,9 +1837,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if is_admin(chat_id):
         keyboard = main_admin_keyboard()
+        text = f"Главное меню\n\n🤖 Версия бота: {VERSION}"
     else:
         keyboard = main_user_keyboard()
-    await update.message.reply_text("Действие отменено.", reply_markup=keyboard)
+        text = f"Главное меню\n\n🤖 Версия бота: {VERSION}"
+    await update.message.reply_text(text, reply_markup=keyboard)
     return ConversationHandler.END
 
 # ---------- ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
@@ -1847,7 +1873,7 @@ async def product_select_callback(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("Отменено (₽)", callback_data="metric_canceled_sum")],
             [InlineKeyboardButton("Отменено (шт.)", callback_data="metric_canceled_units")],
             [InlineKeyboardButton("Средний чек (₽)", callback_data="metric_avg_check")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="metric_cancel")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="metric_cancel")]
         ]
         await query.edit_message_text(
             f"Выбран товар: {product_name} (SKU: {sku})\nТеперь выберите метрику для графика:",
@@ -1873,7 +1899,7 @@ async def product_metric_callback(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("📅 Текущий год", callback_data="period_current")],
             [InlineKeyboardButton("📆 Выбрать год", callback_data="period_select_year")],
             [InlineKeyboardButton("📊 Диапазон лет", callback_data="period_range")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")]
+            [InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")]
         ]
         await query.edit_message_text(
             "Выберите период для построения графика:",
@@ -1913,7 +1939,7 @@ async def product_period_callback(update: Update, context: ContextTypes.DEFAULT_
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"year_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PRODUCT_SINGLE_YEAR
 
@@ -2055,21 +2081,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_month_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_YEAR
     if data == "period_quarter":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_quarter_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_YEAR
     if data == "period_year":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"period_year_only_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_YEAR_SELECT
     if data == "period_custom":
@@ -2088,7 +2114,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"period_month_{i}_{year}")] for i, name in enumerate(months, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_MONTH
     if data.startswith("period_year_quarter_"):
@@ -2096,7 +2122,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['period_year'] = year
         quarters = ["1 квартал (янв-мар)", "2 квартал (апр-июн)", "3 квартал (июл-сен)", "4 квартал (окт-дек)"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"period_quarter_{i}_{year}")] for i, name in enumerate(quarters, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="period_cancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="period_cancel")])
         await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PERIOD_QUARTER
 
@@ -2248,7 +2274,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"dynamics_year_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="dynamics_cancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="dynamics_cancel")])
         await query.edit_message_text("Выберите год для отображения графика:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_DYNAMICS_SELECT
 
@@ -2318,21 +2344,21 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"pyear_month_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="pcancel")])
         await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PRODUCT_YEAR
     if data == "pquarter":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"pyear_quarter_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="pcancel")])
         await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PRODUCT_YEAR
     if data == "pyear":
         current_year = get_moscow_today().year
         years = list(range(current_year - 9, current_year + 1))
         buttons = [[InlineKeyboardButton(str(y), callback_data=f"pyear_only_{y}")] for y in years]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="pcancel")])
         await query.edit_message_text("Выберите год:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PRODUCT_YEAR_SELECT
     if data == "pcustom":
@@ -2351,7 +2377,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
                   "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"pmonth_{i}_{year}")] for i, name in enumerate(months, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="pcancel")])
         await query.edit_message_text(f"Выберите месяц {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PRODUCT_MONTH
     if data.startswith("pyear_quarter_"):
@@ -2359,7 +2385,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data['p_year'] = year
         quarters = ["1 квартал (янв-мар)", "2 квартал (апр-июн)", "3 квартал (июл-сен)", "4 квартал (окт-дек)"]
         buttons = [[InlineKeyboardButton(name, callback_data=f"pquarter_{i}_{year}")] for i, name in enumerate(quarters, 1)]
-        buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="pcancel")])
+        buttons.append([InlineKeyboardButton("🔙 Назад", callback_data="pcancel")])
         await query.edit_message_text(f"Выберите квартал {year}:", reply_markup=InlineKeyboardMarkup(buttons))
         return WAITING_PRODUCT_QUARTER
 
@@ -2624,7 +2650,8 @@ def main():
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
                 "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n\n"
+                f"🤖 Версия бота: {VERSION}"
             )
         else:
             help_text = (
@@ -2649,7 +2676,8 @@ def main():
                 "• Для «Сегодня» – сравнение с аналогичным временем вчера.\n"
                 "• Для «Текущий месяц» – сравнение с аналогичным периодом предыдущего месяца (с учётом времени).\n\n"
                 "🔹 *Часовой пояс*\n"
-                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n"
+                "• Все расчёты ведутся по московскому времени (МСК, UTC+3).\n\n"
+                f"🤖 Версия бота: {VERSION}"
             )
         await update.message.reply_text(help_text, parse_mode="Markdown")
     application.add_handler(CommandHandler("help", help_command))
