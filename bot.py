@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.6"  # Исправлено дублирование рекламы (перезапись, а не сложение)
+VERSION = "2.0.7"  # Кнопки товара в 3 строки, убран ручной ввод SKU
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -97,7 +97,7 @@ WAITING_PRODUCT_PERIOD_CHOICE = 32
 WAITING_PRODUCT_SINGLE_YEAR = 33
 WAITING_PRODUCT_RANGE_START = 34
 WAITING_PRODUCT_RANGE_END = 35
-WAITING_PRODUCT_SKU_MANUAL = 36
+# WAITING_PRODUCT_SKU_MANUAL = 36  # УДАЛЕН
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -558,7 +558,7 @@ async def fetch_finance_transactions(date_from, date_to):
     await save_to_cache(cache_key, all_transactions)
     return all_transactions
 
-# ---------- АГРЕГАЦИЯ ФИНАНСОВ (УБРАНЫ ОТЛАДОЧНЫЕ ЛОГИ) ----------
+# ---------- АГРЕГАЦИЯ ФИНАНСОВ ----------
 def aggregate_finance_expenses(transactions):
     expense_by_type = {}
 
@@ -1002,7 +1002,6 @@ def format_expense_block(expenses_by_type, title):
         "Баллы за скидки": "Баллы за скидки",
         "Выручка": "Выручка",
         "Возврат выручки": "Возврат выручки",
-        # "Реклама" – убрали, чтобы не дублировалось
     }
 
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
@@ -1672,17 +1671,23 @@ async def handle_products_reports(update: Update, context: ContextTypes.DEFAULT_
         context.user_data['product_list'] = top_products
         keyboard = []
         for idx, (sku, stats) in enumerate(top_products, 1):
-            name = stats['name'][:30]
+            name = stats['name']  # полное название (до 60 символов уже обрезано)
+            # Разбиваем название на две строки по 30 символов
+            first_line = name[:30]
+            second_line = name[30:60] if len(name) > 30 else ""
+            # Формируем третью строку: SKU и ART (если есть)
             offer_id = stats.get('offer_id', '')
             if offer_id:
-                text = f"{idx}. SKU:{sku} {name} (Арт:{offer_id})"
+                third_line = f"SKU: {sku}  ART: {offer_id}"
             else:
-                text = f"{idx}. SKU:{sku} {name}"
-            keyboard.append([InlineKeyboardButton(text, callback_data=f"prod_{sku}")])
-        keyboard.append([InlineKeyboardButton("✏️ Ввести SKU вручную", callback_data="prod_manual")])
+                third_line = f"SKU: {sku}"
+            # Собираем текст кнопки
+            button_text = f"{first_line}\n{second_line}\n{third_line}" if second_line else f"{first_line}\n\n{third_line}"
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"prod_{sku}")])
+        # Добавляем только кнопку "Отмена" (без ручного ввода)
         keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="prod_cancel")])
         await update.message.reply_text(
-            "Выберите товар, нажав на соответствующую кнопку, или введите SKU вручную:",
+            "Выберите товар, нажав на соответствующую кнопку:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return WAITING_PRODUCT_SELECT
@@ -1817,44 +1822,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Действие отменено.", reply_markup=keyboard)
     return ConversationHandler.END
 
-# ---------- НОВЫЕ ОБРАБОТЧИКИ ДЛЯ РУЧНОГО ВВОДА SKU ----------
-async def product_manual_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Введите SKU товара (числовой идентификатор):")
-    return WAITING_PRODUCT_SKU_MANUAL
-
-async def product_manual_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if not text.isdigit():
-        await update.message.reply_text("❌ SKU должен быть числом. Попробуйте снова или отмените командой /cancel.")
-        return WAITING_PRODUCT_SKU_MANUAL
-    sku = text
-    product_list = context.user_data.get('product_list', [])
-    product_name = "Товар"
-    for p_sku, stats in product_list:
-        if p_sku == sku:
-            product_name = stats['name'][:40]
-            break
-    context.user_data['product_sku'] = sku
-    context.user_data['product_name'] = product_name
-
-    keyboard = [
-        [InlineKeyboardButton("Заказано (₽)", callback_data="metric_ordered_sum")],
-        [InlineKeyboardButton("Заказано (шт.)", callback_data="metric_ordered_units")],
-        [InlineKeyboardButton("Доставлено (₽)", callback_data="metric_delivered_sum")],
-        [InlineKeyboardButton("Доставлено (шт.)", callback_data="metric_delivered_units")],
-        [InlineKeyboardButton("Отменено (₽)", callback_data="metric_canceled_sum")],
-        [InlineKeyboardButton("Отменено (шт.)", callback_data="metric_canceled_units")],
-        [InlineKeyboardButton("Средний чек (₽)", callback_data="metric_avg_check")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="metric_cancel")]
-    ]
-    await update.message.reply_text(
-        f"Выбран товар: {product_name} (SKU: {sku})\nТеперь выберите метрику для графика:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return WAITING_PRODUCT_METRIC
-
 # ---------- ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
 async def product_select_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1864,10 +1831,6 @@ async def product_select_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Выбор товара отменён.")
         await query.message.reply_text("Выберите действие:", reply_markup=products_reports_keyboard())
         return ConversationHandler.END
-
-    if data == "prod_manual":
-        await query.edit_message_text("Введите SKU товара (числовой идентификатор):")
-        return WAITING_PRODUCT_SKU_MANUAL
 
     if data.startswith("prod_"):
         sku = data[5:]
@@ -2543,8 +2506,6 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     # ---------- НОВЫЕ ОБРАБОТЧИКИ ДИНАМИКИ ПО ТОВАРУ ----------
     if data.startswith("prod_"):
         return await product_select_callback(update, context)
-    if data == "prod_manual":
-        return await product_manual_callback(update, context)
     if data.startswith("metric_"):
         return await product_metric_callback(update, context)
     if data.startswith("period_") or data.startswith("year_") or data == "period_cancel" or data == "period_current" or data == "period_select_year" or data == "period_range":
@@ -2752,6 +2713,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    # Диалог динамики по товару (без ручного ввода SKU)
     conv_product_chart = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("📈 Динамика по товару"), handle_products_reports)],
         states={
@@ -2761,7 +2723,7 @@ def main():
             WAITING_PRODUCT_SINGLE_YEAR: [CallbackQueryHandler(handle_callback_query)],
             WAITING_PRODUCT_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_start)],
             WAITING_PRODUCT_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_range_end)],
-            WAITING_PRODUCT_SKU_MANUAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_manual_input)],
+            # WAITING_PRODUCT_SKU_MANUAL удалён
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
