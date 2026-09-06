@@ -16,7 +16,7 @@ from telegram.warnings import PTBUserWarning
 from telegram.helpers import escape_markdown
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.2"  # 🔄 Меняйте номер при каждом обновлении
+VERSION = "2.0.3"  # Исправлено дублирование рекламы в расходах
 
 # Графики
 import matplotlib.pyplot as plt
@@ -267,7 +267,7 @@ class RateLimiter:
             self.last_request_time = time.time()
 
 # ==================== ИНИЦИАЛИЗАЦИЯ HTTP СЕССИИ ====================
-async def init_http_session(app):  # теперь принимает параметр
+async def init_http_session(app):
     global _http_session, _rate_limiter
     _rate_limiter = RateLimiter()
     timeout = aiohttp.ClientTimeout(total=API_TIMEOUT)
@@ -282,7 +282,7 @@ async def init_http_session(app):  # теперь принимает парам�
     )
     write_log(f"✅ HTTP-сессия aiohttp инициализирована (v{VERSION})")
 
-async def close_http_session(app):  # теперь принимает параметр
+async def close_http_session(app):
     global _http_session
     if _http_session:
         await _http_session.close()
@@ -1027,7 +1027,7 @@ def format_expense_block(expenses_by_type, title):
         "Баллы за скидки": "Баллы за скидки",
         "Выручка": "Выручка",
         "Возврат выручки": "Возврат выручки",
-        "Реклама": "Реклама",
+        "Реклама": "Реклама",  # оставлено для совместимости, но теперь не будет использоваться
     }
 
     sorted_items = sorted(expenses_by_type.items(), key=lambda x: x[1], reverse=True)
@@ -1224,10 +1224,11 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     expenses_today = aggregate_finance_expenses(fin_today)
     expenses_month = aggregate_finance_expenses(fin_month)
 
+    # Рекламные расходы добавляем в категорию "Оплата за клик" (если уже есть, то суммируем)
     if ad_today > 0:
-        expenses_today["Реклама"] = ad_today
+        expenses_today["Оплата за клик"] = expenses_today.get("Оплата за клик", 0) + ad_today
     if ad_month > 0:
-        expenses_month["Реклама"] = ad_month
+        expenses_month["Оплата за клик"] = expenses_month.get("Оплата за клик", 0) + ad_month
 
     def fmt_num(val):
         return f"{val:,.2f}".replace(",", " ") if val else "0.00"
