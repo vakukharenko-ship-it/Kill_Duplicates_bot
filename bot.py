@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
 # ==================== ВЕРСИЯ БОТА ====================
-VERSION = "2.0.5"  # Удалены отладочные логи транзакций
+VERSION = "2.0.6"  # Исправлено дублирование рекламы (перезапись, а не сложение)
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 15
@@ -1199,13 +1199,12 @@ async def format_combined_metrics_with_deltas(include_yesterday=False):
     expenses_today = aggregate_finance_expenses(fin_today)
     expenses_month = aggregate_finance_expenses(fin_month)
 
-    # Рекламные расходы добавляем в категорию "Оплата за клик" (если уже есть, то суммируем)
-    # и удаляем отдельную запись "Реклама", если она появилась из финансов
+    # Рекламные расходы: перезаписываем категорию "Оплата за клик" (или создаём), удаляем "Реклама"
     if ad_today > 0:
-        expenses_today["Оплата за клик"] = expenses_today.get("Оплата за клик", 0) + ad_today
+        expenses_today["Оплата за клик"] = ad_today
         expenses_today.pop("Реклама", None)
     if ad_month > 0:
-        expenses_month["Оплата за клик"] = expenses_month.get("Оплата за клик", 0) + ad_month
+        expenses_month["Оплата за клик"] = ad_month
         expenses_month.pop("Реклама", None)
 
     def fmt_num(val):
